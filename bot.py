@@ -132,75 +132,74 @@ def db_mark_sent(item_id: int, sent_date: str):
        .execute())
 
 # ─────────────────── ИИ (Gemini 1.5 Flash) ────────────────────
-PARSE_PROMPT = """Ты — умный парсер команд личного Telegram-бота-ассистента.
+PARSE_PROMPT = """Ты — парсер команд личного Telegram-бота. Твоя задача — понять что хочет пользователь, даже если фраза длинная или написана в произвольной форме.
 Сейчас: {now}
 
 Пользователь написал: "{msg}"
 
-Верни ТОЛЬКО JSON без markdown-блоков и без пояснений — ничего лишнего.
+Верни ТОЛЬКО JSON без markdown, без пояснений.
 
 {{
   "action":        "add_reminder" | "add_note" | "add_habit" | "list" | "delete" | "set_quote" | "chat" | "unknown",
-  "text":          "суть задачи — коротко и понятно",
+  "text":          "суть задачи одной короткой фразой",
   "hour":          null или 0-23,
   "minute":        0-59,
   "is_daily":      true или false,
   "interval_days": 1,
   "delete_id":     null или число,
-  "quote_example": null или "пример стиля цитаты",
-  "reply":         null или "короткий дружелюбный ответ (1-2 предложения)"
+  "quote_example": null или строка,
+  "reply":         null или "ответ если action=chat"
 }}
 
-═══ ПРАВИЛА ОПРЕДЕЛЕНИЯ ACTION ═══
+══════════ ПРАВИЛА (приоритет сверху вниз) ══════════
 
-add_reminder — напоминание по времени:
-  • "напомни в X / напомни мне в X часов" → hour=X, is_daily=false
-  • "каждый день в X / ежедневно в X" → is_daily=true, interval_days=1, hour=X
-  • "каждый второй день / через день / раз в 2 дня" → is_daily=true, interval_days=2
-  • "каждые N дней / каждый N-й день / раз в N дней" → is_daily=true, interval_days=N
+① Есть ВРЕМЯ (в XX:00 / в XX часов) + интервал (каждый день/второй/N дней):
+   → add_reminder, hour=то что указано, is_daily=true
+   → interval_days по интервалу
 
-add_note — записать и напоминать каждый день в 9:00:
-  • "запомни / запиши / не забыть / нужно не забыть / напомни что нужно"
-  • hour=9, is_daily=true, interval_days=1
+② "запомни/запиши/напомни что" + есть время или интервал:
+   → это НЕ add_note! Это add_reminder с нужным временем и интервалом.
+   → add_note только если нет ни времени ни интервала
 
-add_habit — привычка с любым ритмом (по умолчанию 8:00):
-  • "хочу каждый день X / напоминай каждый день X / привычка"
-  • "напоминай пить воду / выпить витаминку / делать зарядку" + каждый/каждые
-  • "каждый второй день напоминай X" → interval_days=2
-  • "раз в 3 дня X" → interval_days=3
-  • is_daily=true всегда
+③ Интервалы:
+   каждый день / ежедневно          → interval_days=1
+   каждый второй день / через день  → interval_days=2
+   каждые N дней / раз в N дней     → interval_days=N
 
-list — показать список:
-  • "покажи список / что у меня / мои задачи / список / что запланировано"
+④ Ключевые слова без времени:
+   "хочу каждый день X / привычка / напоминай каждый день" → add_habit, hour=8
+   "запомни/запиши" без интервала → add_note, hour=9
+   "список/покажи/что у меня" → list
+   "удали/убери номер X" → delete, delete_id=X
+   "цитаты/мотивация/вдохновение" → set_quote
+   приветствие/разговор → chat, reply="ответ"
 
-delete — удалить задачу:
-  • "удали / убери / удалить номер X" → delete_id=X
+Если время не указано: add_reminder → hour=8, add_note → hour=9, add_habit → hour=8
 
-set_quote — настроить цитаты дня:
-  • "цитата / мотивация / вдохновение / присылай цитаты"
+══════════ КОНКРЕТНЫЕ ПРИМЕРЫ (обязательно учи!) ══════════
 
-chat — обычный разговор / приветствие / вопрос не по теме:
-  • Напиши reply: короткий дружелюбный ответ на то что сказал пользователь
+ВХОД:  "запомни: нужно напоминать мне каждый второй день, например 9 июня, 11 июня, в 20:00 откачать воду"
+ВЫХОД: {{"action":"add_reminder","text":"Откачать воду","hour":20,"minute":0,"is_daily":true,"interval_days":2,"delete_id":null,"quote_example":null,"reply":null}}
 
-═══ ПРИМЕРЫ (важно!) ═══
-"запомни что нужно каждый второй день напоминать мне выпить воды с витаминкой"
-→ action=add_habit, text="Выпить воды с витаминкой", interval_days=2, hour=8
+ВХОД:  "каждый второй день в 20:00 напоминай откачать воду"
+ВЫХОД: {{"action":"add_reminder","text":"Откачать воду","hour":20,"minute":0,"is_daily":true,"interval_days":2,"delete_id":null,"quote_example":null,"reply":null}}
 
-"напомни каждые 3 дня проверить почту"
-→ action=add_reminder, text="Проверить почту", interval_days=3, is_daily=true, hour=8
+ВХОД:  "напомни каждые 3 дня в 10:00 проверить почту"
+ВЫХОД: {{"action":"add_reminder","text":"Проверить почту","hour":10,"minute":0,"is_daily":true,"interval_days":3,"delete_id":null,"quote_example":null,"reply":null}}
 
-"раз в два дня напоминай полить цветы"
-→ action=add_habit, text="Полить цветы", interval_days=2, hour=8
+ВХОД:  "хочу каждый день делать зарядку"
+ВЫХОД: {{"action":"add_habit","text":"Делать зарядку","hour":8,"minute":0,"is_daily":true,"interval_days":1,"delete_id":null,"quote_example":null,"reply":null}}
 
-"привет как дела"
-→ action=chat, reply="Привет! Всё отлично, готов помочь 😊"
+ВХОД:  "раз в два дня напоминай полить цветы"
+ВЫХОД: {{"action":"add_habit","text":"Полить цветы","hour":8,"minute":0,"is_daily":true,"interval_days":2,"delete_id":null,"quote_example":null,"reply":null}}
 
-═══ ЕСЛИ ВРЕМЯ НЕ УКАЗАНО ═══
-  add_reminder → hour=8
-  add_note     → hour=9
-  add_habit    → hour=8
+ВХОД:  "запомни купить молоко"
+ВЫХОД: {{"action":"add_note","text":"Купить молоко","hour":9,"minute":0,"is_daily":true,"interval_days":1,"delete_id":null,"quote_example":null,"reply":null}}
 
-ВАЖНО: interval_days всегда число ≥ 1. Сохраняй язык пользователя в поле text."""
+ВХОД:  "привет как дела"
+ВЫХОД: {{"action":"chat","text":"","hour":null,"minute":0,"is_daily":false,"interval_days":1,"delete_id":null,"quote_example":null,"reply":"Привет! Всё хорошо, готов помочь 😊"}}
+
+ВАЖНО: interval_days всегда ≥ 1. Игнорируй примерные даты типа "например 9 июня, 11 июня" — это просто пояснение пользователя."""
 
 async def ai_parse(text: str) -> dict:
     now    = datetime.now(TZ).strftime("%H:%M %d.%m.%Y")
@@ -208,10 +207,30 @@ async def ai_parse(text: str) -> dict:
     try:
         resp = await asyncio.to_thread(ai.generate_content, prompt)
         raw  = re.sub(r"```(?:json)?\s*|\s*```", "", resp.text).strip()
-        return json.loads(raw)
+        data = json.loads(raw)
+        # Защита: если action неизвестен но есть время — скорее всего это reminder
+        if data.get("action") == "unknown" and data.get("hour") is not None:
+            data["action"] = "add_reminder"
+            data.setdefault("is_daily", False)
+        return data
     except Exception as e:
-        log.error(f"ai_parse: {e}")
+        log.error(f"ai_parse error: {e}  |  raw: {resp.text[:200] if 'resp' in dir() else '—'}")
         return {"action": "unknown"}
+
+async def ai_fallback_reply(text: str) -> str:
+    """Умный ответ когда не удалось распознать команду."""
+    prompt = (
+        f"Ты — дружелюбный помощник в Telegram. Пользователь написал: '{text}'.\n"
+        "Если это похоже на попытку добавить напоминание/привычку/заметку, но написано непонятно — "
+        "объясни как именно нужно написать (коротко, 1-2 примера). "
+        "Если это просто разговор — ответь по-человечески. "
+        "Отвечай на русском, коротко (2-3 строки максимум)."
+    )
+    try:
+        resp = await asyncio.to_thread(ai.generate_content, prompt)
+        return resp.text.strip()
+    except Exception:
+        return "Попробуй написать проще, например: _Напомни в 20:00 откачать воду каждый второй день_"
 
 async def ai_quote(example: str) -> str:
     prompt = (
@@ -551,13 +570,10 @@ async def handle_msg(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await u.message.reply_text(reply)
 
     else:
+        # Умный fallback — AI отвечает сам, объясняет как написать правильно
+        reply = await ai_fallback_reply(text)
         await u.message.reply_text(
-            "🤔 Не совсем понял. Попробуй:\n\n"
-            "• _Напомни в 18:00 почистить зубы_\n"
-            "• _Запомни: купить продукты_\n"
-            "• _Каждый второй день напоминай пить витаминку_\n"
-            "• _Раз в три дня напоминай полить цветы_\n\n"
-            "Или нажми /menu 👇",
+            reply,
             parse_mode="Markdown",
             reply_markup=main_keyboard()
         )
