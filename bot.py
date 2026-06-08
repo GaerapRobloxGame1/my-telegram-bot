@@ -1,5 +1,5 @@
 # =============================================================
-#  Telegram Personal Assistant Bot
+#  Telegram Personal Assistant Bot — v2
 #  AI: Google Gemini 1.5 Flash (бесплатно, 1500 запросов/день)
 #  DB: Supabase (PostgreSQL, бесплатно)
 #  Host: Render.com + UptimeRobot
@@ -9,9 +9,9 @@ import os, asyncio, logging, threading, json, re
 from datetime import datetime
 import pytz
 
-from telegram import Update
+from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Application, CommandHandler,
+    Application, CommandHandler, CallbackQueryHandler,
     MessageHandler, filters, ContextTypes
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -35,6 +35,36 @@ PORT           = int(os.environ.get("PORT", 5000))
 TIMEZONE       = os.environ.get("TIMEZONE", "Europe/Moscow")
 TZ             = pytz.timezone(TIMEZONE)
 
+# ─────────────── БЕЛЫЙ СПИСОК ПОЛЬЗОВАТЕЛЕЙ ───────────────────
+# В .env добавь: ALLOWED_USERS=123456789,987654321
+# Если переменная пуста — бот открыт для всех
+_raw = os.environ.get("ALLOWED_USERS", "")
+ALLOWED_USERS: set[int] = set(
+    int(x.strip()) for x in _raw.split(",") if x.strip().isdigit()
+)
+
+def is_allowed(user_id: int) -> bool:
+    """True если список пуст (открытый бот) или пользователь в списке."""
+    return not ALLOWED_USERS or user_id in ALLOWED_USERS
+
+async def check_access(update: Update) -> bool:
+    """Проверяет доступ. При отказе — отвечает с ID и возвращает False."""
+    user = update.effective_user
+    if is_allowed(user.id):
+        return True
+    name = user.first_name or "Пользователь"
+    await update.effective_message.reply_text(
+        f"⛔ *Доступ закрыт*\n\n"
+        f"Привет, {name}! Этот бот личный.\n\n"
+        f"Твой Telegram ID:\n`{user.id}`\n\n"
+        f"Отправь его владельцу бота — он добавит тебя в список разрешённых.",
+        parse_mode="Markdown"
+    )
+    log.info(
+        f"BLOCKED  id={user.id}  name={user.first_name}  @{user.username}"
+    )
+    return False
+
 # ──────────────────────── КЛИЕНТЫ ─────────────────────────────
 genai.configure(api_key=GEMINI_API_KEY)
 ai    = genai.GenerativeModel("gemini-1.5-flash")
@@ -52,15 +82,23 @@ def start_flask():
     http.run(host="0.0.0.0", port=PORT, use_reloader=False)
 
 # ──────────────────────── БАЗА ДАННЫХ ─────────────────────────
-def db_add(chat_id, kind, text, hour=None, minute=0, daily=False):
+# Выполни в Supabase SQL Editor один раз (добавляет новые столбцы):
+#
+#   ALTER TABLE bot_items ADD COLUMN IF NOT EXISTS interval_days  INT  DEFAULT 1;
+#   ALTER TABLE bot_items ADD COLUMN IF NOT EXISTS last_sent_date DATE;
+
+def db_add(chat_id, kind, text, hour=None, minute=0,
+           daily=False, interval_days=1):
     row = {
-        "chat_id": str(chat_id),
-        "type": kind,
-        "text": text,
-        "remind_hour":   hour,
-        "remind_minute": int(minute or 0),
-        "is_daily":      bool(daily),
-        "is_active":     True
+        "chat_id":        str(chat_id),
+        "type":           kind,
+        "text":           text,
+        "remind_hour":    hour,
+        "remind_minute":  int(minute or 0),
+        "is_daily":       bool(daily),
+        "is_active":      True,
+        "interval_days":  int(interval_days or 1),
+        "last_sent_date": None,
     }
     r = db.table("bot_items").insert(row).execute()
     return r.data[0] if r.data else None
@@ -87,37 +125,85 @@ def db_due(hour, minute):
               .eq("remind_minute", minute)
               .execute().data or [])
 
+def db_mark_sent(item_id: int, sent_date: str):
+    (db.table("bot_items")
+       .update({"last_sent_date": sent_date})
+       .eq("id", item_id)
+       .execute())
+
 # ─────────────────── ИИ (Gemini 1.5 Flash) ────────────────────
-PARSE_PROMPT = """Ты — парсер команд Telegram-бота.
+PARSE_PROMPT = """Ты — умный парсер команд личного Telegram-бота-ассистента.
 Сейчас: {now}
 
-Верни ТОЛЬКО JSON без markdown и пояснений:
+Пользователь написал: "{msg}"
 
-Сообщение: "{msg}"
+Верни ТОЛЬКО JSON без markdown-блоков и без пояснений — ничего лишнего.
 
 {{
-  "action":        "add_reminder"|"add_note"|"add_habit"|"list"|"delete"|"set_quote"|"unknown",
-  "text":          "текст задачи",
+  "action":        "add_reminder" | "add_note" | "add_habit" | "list" | "delete" | "set_quote" | "chat" | "unknown",
+  "text":          "суть задачи — коротко и понятно",
   "hour":          null или 0-23,
   "minute":        0-59,
-  "is_daily":      true/false,
+  "is_daily":      true или false,
+  "interval_days": 1,
   "delete_id":     null или число,
-  "quote_example": null или "пример цитаты"
+  "quote_example": null или "пример стиля цитаты",
+  "reply":         null или "короткий дружелюбный ответ (1-2 предложения)"
 }}
 
-Правила:
-• "напомни в X" → add_reminder, hour=X
-• "каждый день в X" → add_reminder, is_daily=true, hour=X
-• "запомни/запиши/не забыть" → add_note, hour=9, is_daily=true
-• "каждый день X / привычка / хочу ежедневно" → add_habit, hour=8, is_daily=true
-• "покажи/список/что у меня" → list
-• "удали/убери" → delete, delete_id=число из текста
-• "цитата/мотивация/вдохновение" → set_quote
-• Без указанного времени → hour=8
-• Язык текста — сохранить как у пользователя"""
+═══ ПРАВИЛА ОПРЕДЕЛЕНИЯ ACTION ═══
+
+add_reminder — напоминание по времени:
+  • "напомни в X / напомни мне в X часов" → hour=X, is_daily=false
+  • "каждый день в X / ежедневно в X" → is_daily=true, interval_days=1, hour=X
+  • "каждый второй день / через день / раз в 2 дня" → is_daily=true, interval_days=2
+  • "каждые N дней / каждый N-й день / раз в N дней" → is_daily=true, interval_days=N
+
+add_note — записать и напоминать каждый день в 9:00:
+  • "запомни / запиши / не забыть / нужно не забыть / напомни что нужно"
+  • hour=9, is_daily=true, interval_days=1
+
+add_habit — привычка с любым ритмом (по умолчанию 8:00):
+  • "хочу каждый день X / напоминай каждый день X / привычка"
+  • "напоминай пить воду / выпить витаминку / делать зарядку" + каждый/каждые
+  • "каждый второй день напоминай X" → interval_days=2
+  • "раз в 3 дня X" → interval_days=3
+  • is_daily=true всегда
+
+list — показать список:
+  • "покажи список / что у меня / мои задачи / список / что запланировано"
+
+delete — удалить задачу:
+  • "удали / убери / удалить номер X" → delete_id=X
+
+set_quote — настроить цитаты дня:
+  • "цитата / мотивация / вдохновение / присылай цитаты"
+
+chat — обычный разговор / приветствие / вопрос не по теме:
+  • Напиши reply: короткий дружелюбный ответ на то что сказал пользователь
+
+═══ ПРИМЕРЫ (важно!) ═══
+"запомни что нужно каждый второй день напоминать мне выпить воды с витаминкой"
+→ action=add_habit, text="Выпить воды с витаминкой", interval_days=2, hour=8
+
+"напомни каждые 3 дня проверить почту"
+→ action=add_reminder, text="Проверить почту", interval_days=3, is_daily=true, hour=8
+
+"раз в два дня напоминай полить цветы"
+→ action=add_habit, text="Полить цветы", interval_days=2, hour=8
+
+"привет как дела"
+→ action=chat, reply="Привет! Всё отлично, готов помочь 😊"
+
+═══ ЕСЛИ ВРЕМЯ НЕ УКАЗАНО ═══
+  add_reminder → hour=8
+  add_note     → hour=9
+  add_habit    → hour=8
+
+ВАЖНО: interval_days всегда число ≥ 1. Сохраняй язык пользователя в поле text."""
 
 async def ai_parse(text: str) -> dict:
-    now = datetime.now(TZ).strftime("%H:%M %d.%m.%Y")
+    now    = datetime.now(TZ).strftime("%H:%M %d.%m.%Y")
     prompt = PARSE_PROMPT.format(now=now, msg=text)
     try:
         resp = await asyncio.to_thread(ai.generate_content, prompt)
@@ -141,49 +227,85 @@ async def ai_quote(example: str) -> str:
 
 # ──────────────────────── ПЛАНИРОВЩИК ─────────────────────────
 async def tick(bot):
-    """Запускается каждую минуту — отправляет всё что запланировано."""
-    now   = datetime.now(TZ)
-    items = db_due(now.hour, now.minute)
+    """Каждую минуту — рассылает запланированное, учитывает interval_days."""
+    now     = datetime.now(TZ)
+    today_s = now.strftime("%Y-%m-%d")
+    today_d = now.date()
+    items   = db_due(now.hour, now.minute)
+
     for item in items:
+        interval  = int(item.get("interval_days") or 1)
+        last_sent = item.get("last_sent_date")
+
+        # Проверяем интервал для задач "каждые N дней"
+        if last_sent and interval > 1:
+            try:
+                last_d     = datetime.strptime(str(last_sent)[:10], "%Y-%m-%d").date()
+                days_since = (today_d - last_d).days
+                if days_since < interval:
+                    continue   # ещё рано
+            except Exception:
+                pass
+
         cid = int(item["chat_id"])
         try:
             t = item["type"]
             if t == "reminder":
                 await bot.send_message(cid, f"⏰ Напоминание: {item['text']}")
+                db_mark_sent(item["id"], today_s)
                 if not item["is_daily"]:
-                    db_off(item["id"], cid)          # разовое — удаляем
+                    db_off(item["id"], cid)
 
             elif t == "note":
                 await bot.send_message(cid, f"📝 Не забудь: {item['text']}")
+                db_mark_sent(item["id"], today_s)
 
             elif t == "habit":
                 await bot.send_message(cid, f"💪 Время привычки: {item['text']}")
+                db_mark_sent(item["id"], today_s)
 
             elif t == "quote_config":
                 q = await ai_quote(item["text"])
                 await bot.send_message(
                     cid, f"✨ *Цитата дня:*\n\n{q}", parse_mode="Markdown"
                 )
+                db_mark_sent(item["id"], today_s)
+
         except Exception as e:
             log.error(f"tick item {item.get('id')}: {e}")
 
-# ────────────────────── ОБРАБОТЧИКИ БОТА ──────────────────────
+# ──────────────── КЛАВИАТУРА БЫСТРЫХ ДЕЙСТВИЙ ─────────────────
+def main_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📋 Мои задачи",  callback_data="list"),
+            InlineKeyboardButton("☀️ На сегодня",  callback_data="today"),
+        ],
+        [
+            InlineKeyboardButton("✨ Цитата",       callback_data="quote"),
+            InlineKeyboardButton("📖 Помощь",       callback_data="help"),
+        ],
+        [
+            InlineKeyboardButton("🔑 Мой Telegram ID", callback_data="myid"),
+        ],
+    ])
+
+# ────────────────────── ТЕКСТЫ ─────────────────────────────────
 WELCOME = (
     "👋 Привет! Я твой личный ассистент.\n\n"
     "Умею:\n"
     "⏰ Напоминать в нужное время\n"
     "📝 Хранить заметки и напоминать каждый день\n"
-    "💪 Следить за ежедневными привычками\n"
+    "💪 Следить за привычками (каждый день или через день)\n"
     "✨ Присылать вдохновляющие цитаты\n\n"
-    "*Просто напиши мне:*\n"
+    "*Пиши естественным языком:*\n"
     "• _Напомни в 18:00 почистить зубы_\n"
-    "• _Запомни: нужно покрасить стену_\n"
-    "• _Каждый день напоминай отжиматься 20 раз_\n"
-    "• _Присылай цитаты, например: Каждый день — новый шанс_\n\n"
-    "/list — мои задачи  |  /help — помощь  |  /today — план на день"
+    "• _Запомни что нужно купить краску_\n"
+    "• _Каждый второй день напоминай пить витаминку_\n"
+    "• _Раз в три дня напоминай полить цветы_\n"
 )
 
-HELP = (
+HELP_TEXT = (
     "📖 *Как пользоваться:*\n\n"
     "⏰ *Напоминания:*\n"
     "— Напомни в 18 часов почистить зубы\n"
@@ -191,35 +313,60 @@ HELP = (
     "📝 *Заметки* (напомню каждый день в 9:00):\n"
     "— Запомни что нужно купить краску\n"
     "— Запиши: позвонить маме\n\n"
-    "💪 *Привычки* (каждый день в 8:00):\n"
+    "💪 *Привычки* (любой ритм):\n"
     "— Хочу каждый день делать зарядку\n"
-    "— Напоминай каждый день пить 2 литра воды\n\n"
+    "— Каждый второй день напоминай пить витаминку\n"
+    "— Раз в три дня напоминай полить цветы\n\n"
     "✨ *Цитаты* (каждый день в 8:00):\n"
     "— Присылай цитаты, пример: Успех — это привычка\n\n"
     "📋 /list — список всех задач\n"
-    "📅 /today — план на сегодня\n"
+    "☀️ /today — план на сегодня\n"
     "✨ /quote — цитата прямо сейчас\n"
-    "🗑 /delete [номер] — удалить задачу"
+    "🗑 /delete [номер] — удалить задачу\n"
+    "🔑 /myid — узнать свой Telegram ID\n"
+    "📋 /menu — кнопки быстрого доступа"
 )
 
-async def cmd_start(u: Update, _):
-    await u.message.reply_text(WELCOME, parse_mode="Markdown")
+# ────────────────────── ОБРАБОТЧИКИ ───────────────────────────
+async def cmd_start(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await check_access(u): return
+    await u.effective_message.reply_text(
+        WELCOME, parse_mode="Markdown", reply_markup=main_keyboard()
+    )
 
-async def cmd_help(u: Update, _):
-    await u.message.reply_text(HELP, parse_mode="Markdown")
+async def cmd_help(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await check_access(u): return
+    await u.effective_message.reply_text(HELP_TEXT, parse_mode="Markdown")
 
-async def cmd_list(u: Update, _):
+async def cmd_menu(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await check_access(u): return
+    await u.effective_message.reply_text(
+        "Выбери действие:", reply_markup=main_keyboard()
+    )
+
+async def cmd_myid(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Показывает Telegram ID — доступно всем, чтобы владелец мог добавить."""
+    user = u.effective_user
+    await u.effective_message.reply_text(
+        f"🔑 *Твой Telegram ID:*\n`{user.id}`\n\n"
+        f"Имя: {user.first_name or '—'}\n"
+        f"Username: @{user.username or '—'}",
+        parse_mode="Markdown"
+    )
+
+async def cmd_list(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await check_access(u): return
     cid   = u.effective_chat.id
     items = db_get(cid)
     if not items:
-        await u.message.reply_text("Задач пока нет. Напиши мне что-нибудь! 😊")
+        await u.effective_message.reply_text("Задач пока нет. Напиши мне что-нибудь! 😊")
         return
 
     groups = {
-        "reminder":    ("⏰ Напоминания",  []),
-        "habit":       ("💪 Привычки",     []),
-        "note":        ("📝 Заметки",      []),
-        "quote_config":("✨ Цитаты",       []),
+        "reminder":     ("⏰ Напоминания",  []),
+        "habit":        ("💪 Привычки",     []),
+        "note":         ("📝 Заметки",      []),
+        "quote_config": ("✨ Цитаты",       []),
     }
     for it in items:
         k = it.get("type", "reminder")
@@ -232,25 +379,32 @@ async def cmd_list(u: Update, _):
             continue
         lines.append(f"*{label}:*")
         for it in grp:
-            h = it.get("remind_hour")
-            m = it.get("remind_minute", 0)
+            h  = it.get("remind_hour")
+            m  = it.get("remind_minute", 0)
+            iv = int(it.get("interval_days") or 1)
             ts = f" _{h:02d}:{m:02d}_" if h is not None else ""
-            ds = " _(ежедн.)_" if it.get("is_daily") else ""
+            if iv > 1:
+                ds = f" _(каждые {iv} дн.)_"
+            elif it.get("is_daily"):
+                ds = " _(ежедн.)_"
+            else:
+                ds = ""
             lines.append(f"  `{it['id']}` — {it['text']}{ts}{ds}")
         lines.append("")
     lines.append("_Удалить: /delete [номер]_")
-    await u.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    await u.effective_message.reply_text("\n".join(lines), parse_mode="Markdown")
 
-async def cmd_today(u: Update, _):
+async def cmd_today(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await check_access(u): return
     cid   = u.effective_chat.id
     items = db_get(cid)
     if not items:
-        await u.message.reply_text("Задач нет. Отличный день! ☀️")
+        await u.effective_message.reply_text("Задач нет. Отличный день! ☀️")
         return
 
-    now = datetime.now(TZ)
+    now   = datetime.now(TZ)
     emoji = {"reminder": "⏰", "habit": "💪", "note": "📝", "quote_config": "✨"}
-    timed   = sorted(
+    timed = sorted(
         [i for i in items if i.get("remind_hour") is not None],
         key=lambda x: (x["remind_hour"], x.get("remind_minute", 0))
     )
@@ -259,46 +413,76 @@ async def cmd_today(u: Update, _):
     lines = [f"☀️ *План на {now.strftime('%d.%m.%Y')}:*\n"]
     for it in timed:
         h, m = it["remind_hour"], it.get("remind_minute", 0)
-        e = emoji.get(it["type"], "•")
-        lines.append(f"{e} *{h:02d}:{m:02d}* — {it['text']}")
+        iv   = int(it.get("interval_days") or 1)
+        e    = emoji.get(it["type"], "•")
+        sfx  = f" _(каждые {iv} дн.)_" if iv > 1 else ""
+        lines.append(f"{e} *{h:02d}:{m:02d}* — {it['text']}{sfx}")
     if untimed:
         lines.append("\n📌 *Без времени:*")
         for it in untimed:
             lines.append(f"  {emoji.get(it['type'],'•')} {it['text']}")
-    await u.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    await u.effective_message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 async def cmd_delete(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await check_access(u): return
     cid  = u.effective_chat.id
     args = ctx.args
     if not args or not args[0].isdigit():
-        await u.message.reply_text(
+        await u.effective_message.reply_text(
             "Укажи номер: `/delete 5`\nСписок: /list", parse_mode="Markdown"
         )
         return
     db_off(int(args[0]), cid)
-    await u.message.reply_text(f"✅ Задача #{args[0]} удалена!")
+    await u.effective_message.reply_text(f"✅ Задача #{args[0]} удалена!")
 
-async def cmd_quote(u: Update, _):
+async def cmd_quote(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await check_access(u): return
     cid     = u.effective_chat.id
     configs = db_get(cid, "quote_config")
     example = configs[0]["text"] if configs else "Каждый день — шанс стать лучше"
-    await u.message.reply_chat_action("typing")
+    await u.effective_message.reply_chat_action("typing")
     q = await ai_quote(example)
-    await u.message.reply_text(f"✨ *Цитата:*\n\n{q}", parse_mode="Markdown")
+    await u.effective_message.reply_text(
+        f"✨ *Цитата:*\n\n{q}", parse_mode="Markdown"
+    )
 
+# ─────────────── CALLBACK (нажатие inline-кнопок) ─────────────
+async def handle_callback(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = u.callback_query
+    await query.answer()          # убирает "часики" у кнопки
+
+    if query.data == "myid":
+        await cmd_myid(u, ctx)    # myid не требует проверки доступа
+        return
+
+    if not await check_access(u): return
+
+    dispatch = {
+        "list":  cmd_list,
+        "today": cmd_today,
+        "quote": cmd_quote,
+        "help":  cmd_help,
+    }
+    handler = dispatch.get(query.data)
+    if handler:
+        await handler(u, ctx)
+
+# ──────────────────── ОБРАБОТЧИК СООБЩЕНИЙ ────────────────────
 async def handle_msg(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await check_access(u): return
     cid    = u.effective_chat.id
     text   = u.message.text
     await u.message.reply_chat_action("typing")
 
-    intent = await ai_parse(text)
-    action = intent.get("action", "unknown")
+    intent        = await ai_parse(text)
+    action        = intent.get("action", "unknown")
+    content       = intent.get("text") or text
+    hour          = intent.get("hour")
+    minute        = int(intent.get("minute") or 0)
+    daily         = bool(intent.get("is_daily", False))
+    interval_days = int(intent.get("interval_days") or 1)
 
     if action == "add_reminder":
-        hour    = intent.get("hour")
-        minute  = int(intent.get("minute") or 0)
-        content = intent.get("text") or text
-        daily   = bool(intent.get("is_daily", False))
         if hour is None:
             await u.message.reply_text(
                 "❓ В какое время напомнить?\n"
@@ -306,15 +490,19 @@ async def handle_msg(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown"
             )
             return
-        db_add(cid, "reminder", content, int(hour), minute, daily)
-        d = " (каждый день)" if daily else ""
+        db_add(cid, "reminder", content, int(hour), minute, daily, interval_days)
+        if interval_days > 1:
+            freq = f" (каждые {interval_days} дн.)"
+        elif daily:
+            freq = " (каждый день)"
+        else:
+            freq = ""
         await u.message.reply_text(
-            f"✅ Напомню в *{int(hour):02d}:{minute:02d}*{d}:\n_{content}_",
+            f"✅ Напомню в *{int(hour):02d}:{minute:02d}*{freq}:\n_{content}_",
             parse_mode="Markdown"
         )
 
     elif action == "add_note":
-        content = intent.get("text") or text
         db_add(cid, "note", content, 9, 0, True)
         await u.message.reply_text(
             f"📝 Записал! Напомню каждый день в *9:00*:\n_{content}_",
@@ -322,12 +510,14 @@ async def handle_msg(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
 
     elif action == "add_habit":
-        content = intent.get("text") or text
-        hour    = int(intent.get("hour") or 8)
-        minute  = int(intent.get("minute") or 0)
-        db_add(cid, "habit", content, hour, minute, True)
+        db_add(cid, "habit", content, int(hour or 8), minute, True, interval_days)
+        if interval_days > 1:
+            freq = f"каждые {interval_days} дня/дней"
+        else:
+            freq = "каждый день"
         await u.message.reply_text(
-            f"💪 Привычка добавлена! Каждый день в *{hour:02d}:{minute:02d}*:\n_{content}_",
+            f"💪 Привычка добавлена! {freq.capitalize()} в "
+            f"*{int(hour or 8):02d}:{minute:02d}*:\n_{content}_",
             parse_mode="Markdown"
         )
 
@@ -344,7 +534,7 @@ async def handle_msg(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     elif action == "set_quote":
         example = (
-            intent.get("quote_example") or intent.get("text")
+            intent.get("quote_example") or content
             or "Каждый день — новый шанс"
         )
         for old in db_get(cid, "quote_config"):
@@ -356,33 +546,65 @@ async def handle_msg(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
 
+    elif action == "chat":
+        reply = intent.get("reply") or "😊 Чем могу помочь?"
+        await u.message.reply_text(reply)
+
     else:
         await u.message.reply_text(
-            "🤔 Не понял. Попробуй:\n\n"
+            "🤔 Не совсем понял. Попробуй:\n\n"
             "• _Напомни в 18:00 почистить зубы_\n"
             "• _Запомни: купить продукты_\n"
-            "• _Каждый день напоминай о зарядке_\n\n"
-            "Или напиши /help",
-            parse_mode="Markdown"
+            "• _Каждый второй день напоминай пить витаминку_\n"
+            "• _Раз в три дня напоминай полить цветы_\n\n"
+            "Или нажми /menu 👇",
+            parse_mode="Markdown",
+            reply_markup=main_keyboard()
         )
+
+# ──────────────── РЕГИСТРАЦИЯ КОМАНД В TELEGRAM ───────────────
+async def post_init(app: Application):
+    """Заполняет меню '/' в Telegram (кнопка рядом с полем ввода)."""
+    await app.bot.set_my_commands([
+        BotCommand("start",  "👋 Начало работы"),
+        BotCommand("menu",   "📋 Быстрое меню с кнопками"),
+        BotCommand("list",   "📋 Все мои задачи"),
+        BotCommand("today",  "☀️ План на сегодня"),
+        BotCommand("quote",  "✨ Получить цитату прямо сейчас"),
+        BotCommand("delete", "🗑 Удалить задачу по номеру"),
+        BotCommand("myid",   "🔑 Узнать мой Telegram ID"),
+        BotCommand("help",   "📖 Помощь и примеры"),
+    ])
+    log.info("✅ Bot commands registered in Telegram menu")
 
 # ──────────────────────────── MAIN ────────────────────────────
 async def main():
-    # Keep-alive HTTP сервер в отдельном потоке
     threading.Thread(target=start_flask, daemon=True).start()
     log.info(f"Flask started on :{PORT}")
 
-    # Telegram Application
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    if ALLOWED_USERS:
+        log.info(f"🔒 Access restricted to IDs: {ALLOWED_USERS}")
+    else:
+        log.info("🌐 Access open to all users (ALLOWED_USERS not set)")
+
+    app = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
+
     app.add_handler(CommandHandler("start",  cmd_start))
     app.add_handler(CommandHandler("help",   cmd_help))
+    app.add_handler(CommandHandler("menu",   cmd_menu))
+    app.add_handler(CommandHandler("myid",   cmd_myid))
     app.add_handler(CommandHandler("list",   cmd_list))
     app.add_handler(CommandHandler("today",  cmd_today))
     app.add_handler(CommandHandler("delete", cmd_delete))
     app.add_handler(CommandHandler("quote",  cmd_quote))
+    app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_msg))
 
-    # Планировщик — каждую минуту проверяет задачи
     sched = AsyncIOScheduler(timezone=TZ)
     sched.add_job(
         tick, IntervalTrigger(minutes=1),
@@ -397,7 +619,7 @@ async def main():
     log.info("✅ Bot is running!")
 
     try:
-        await asyncio.Event().wait()   # висим вечно
+        await asyncio.Event().wait()
     except (KeyboardInterrupt, SystemExit):
         pass
     finally:
