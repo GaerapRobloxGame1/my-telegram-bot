@@ -1,22 +1,19 @@
 # =============================================================
-#  Telegram Personal Assistant Bot — v4
-#  AI:  Google Gemini 3.5 Flash (google-genai SDK)
-#  DB:  Supabase (PostgreSQL)
+#  Telegram Personal Assistant Bot — v4.1
+#  AI:  Gemini 3.5 Flash  (работает с обоими SDK)
+#  DB:  Supabase
 #
-#  SQL — выполни один раз в Supabase SQL Editor:
-#  ─────────────────────────────────────────────
-#  -- Для хранения памяти пользователя
+#  SQL — выполни ОДИН РАЗ в Supabase SQL Editor:
+#  ──────────────────────────────────────────────
 #  CREATE TABLE IF NOT EXISTS bot_memory (
-#    chat_id    TEXT PRIMARY KEY,
-#    facts      TEXT DEFAULT '',
+#    chat_id TEXT PRIMARY KEY,
+#    facts   TEXT DEFAULT '',
 #    updated_at TIMESTAMPTZ DEFAULT NOW()
 #  );
-#
-#  -- Для мягких напоминаний (periodic tasks)
 #  ALTER TABLE bot_items ADD COLUMN IF NOT EXISTS interval_days   INT  DEFAULT 1;
 #  ALTER TABLE bot_items ADD COLUMN IF NOT EXISTS last_sent_date  TEXT;
 #  ALTER TABLE bot_items ADD COLUMN IF NOT EXISTS last_reminded   TEXT;
-#  ─────────────────────────────────────────────
+#  ──────────────────────────────────────────────
 # =============================================================
 
 import os, asyncio, logging, threading, json, re
@@ -26,19 +23,17 @@ import pytz
 from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
-    MessageHandler, filters, ContextTypes
+    MessageHandler, filters, ContextTypes,
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
-from google import genai
-from google.genai import types
 from supabase import create_client, Client
 from flask import Flask
 
 # ─────────────────────── НАСТРОЙКИ ────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s  %(levelname)s  %(message)s"
+    format="%(asctime)s  %(levelname)s  %(message)s",
 )
 log = logging.getLogger(__name__)
 
@@ -50,6 +45,51 @@ PORT           = int(os.environ.get("PORT", 5000))
 TIMEZONE       = os.environ.get("TIMEZONE", "Europe/Moscow")
 TZ             = pytz.timezone(TIMEZONE)
 MODEL          = "gemini-3.5-flash"
+
+# ══════════════════════════════════════════════════════════════
+#  SDK СОВМЕСТИМОСТЬ — работает с google-genai И google-generativeai
+# ══════════════════════════════════════════════════════════════
+try:
+    from google import genai as _g
+    from google.genai import types as _t
+
+    _ai = _g.Client(api_key=GEMINI_API_KEY)
+
+    def _call(prompt: str, system: str = None,
+              json_mode: bool = False, temp: float = 0.7) -> str:
+        kw = {"temperature": temp}
+        if system:
+            kw["system_instruction"] = system
+        if json_mode:
+            kw["response_mime_type"] = "application/json"
+        r = _ai.models.generate_content(
+            model=MODEL,
+            contents=prompt,
+            config=_t.GenerateContentConfig(**kw),
+        )
+        return r.text
+
+    log.info(f"✅ SDK: google-genai  |  Модель: {MODEL}")
+
+except ImportError:
+    import google.generativeai as _g_old
+    _g_old.configure(api_key=GEMINI_API_KEY)
+
+    def _call(prompt: str, system: str = None,
+              json_mode: bool = False, temp: float = 0.7) -> str:
+        full = f"{system}\n\n{prompt}" if system else prompt
+        try:
+            cfg = _g_old.GenerationConfig(
+                temperature=temp,
+                **({"response_mime_type": "application/json"} if json_mode else {}),
+            )
+        except TypeError:
+            cfg = _g_old.GenerationConfig(temperature=temp)
+        m = _g_old.GenerativeModel(model_name=MODEL, generation_config=cfg)
+        return m.generate_content(full).text
+
+    log.info(f"⚠️  SDK: google-generativeai (старый)  |  Модель: {MODEL}")
+    log.info("    Для лучшей совместимости установи: pip install google-genai")
 
 # ─────────────── БЕЛЫЙ СПИСОК ─────────────────────────────────
 _raw = os.environ.get("ALLOWED_USERS", "")
@@ -66,18 +106,16 @@ async def check_access(update: Update) -> bool:
         return True
     await update.effective_message.reply_text(
         f"⛔ *Доступ закрыт*\n\n"
-        f"Привет, {user.first_name or 'Пользователь'}! Этот бот личный.\n\n"
-        f"Твой Telegram ID:\n`{user.id}`\n\nОтправь его владельцу.",
-        parse_mode="Markdown"
+        f"Привет, {user.first_name or 'Пользователь'}!\n"
+        f"Твой ID:\n`{user.id}`",
+        parse_mode="Markdown",
     )
-    log.info(f"BLOCKED  id={user.id}  @{user.username}")
+    log.info(f"BLOCKED id={user.id} @{user.username}")
     return False
 
 # ──────────────────────── КЛИЕНТЫ ─────────────────────────────
 db: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-ai = genai.Client(api_key=GEMINI_API_KEY)
 
-# ─────────────────── FLASK (keep-alive) ───────────────────────
 http = Flask(__name__)
 
 @http.route("/")
@@ -89,88 +127,99 @@ def start_flask():
     http.run(host="0.0.0.0", port=PORT, use_reloader=False)
 
 # ══════════════════════════════════════════════════════════════
-#  БАЗА ДАННЫХ
+#  БАЗА ДАННЫХ  (все вызовы защищены try/except)
 # ══════════════════════════════════════════════════════════════
 
-# ── bot_items (напоминания, привычки, заметки, soft_task) ──────
 def db_add(chat_id, kind, text, hour=None, minute=0,
-           daily=False, interval_days=1):
+           daily=False, interval_days=1) -> dict | None:
     row = {
-        "chat_id":        str(chat_id),
-        "type":           kind,
-        "text":           text,
-        "remind_hour":    hour,
-        "remind_minute":  int(minute or 0),
-        "is_daily":       bool(daily),
-        "is_active":      True,
-        "interval_days":  int(interval_days or 1),
+        "chat_id":       str(chat_id),
+        "type":          kind,
+        "text":          text,
+        "remind_hour":   hour,
+        "remind_minute": int(minute or 0),
+        "is_daily":      bool(daily),
+        "is_active":     True,
         "last_sent_date": None,
-        "last_reminded":  None,
     }
-    r = db.table("bot_items").insert(row).execute()
-    return r.data[0] if r.data else None
+    # Добавляем interval_days, если колонка есть
+    try:
+        r = db.table("bot_items").insert({**row, "interval_days": int(interval_days or 1)}).execute()
+        return r.data[0] if r.data else None
+    except Exception:
+        pass
+    # Fallback без interval_days
+    try:
+        r = db.table("bot_items").insert(row).execute()
+        return r.data[0] if r.data else None
+    except Exception as e:
+        log.error(f"db_add: {e}")
+        return None
 
-def db_get(chat_id, kind=None):
-    q = (db.table("bot_items").select("*")
-           .eq("chat_id", str(chat_id))
-           .eq("is_active", True))
-    if kind:
-        q = q.eq("type", kind)
-    return q.order("id").execute().data or []
+def db_get(chat_id, kind=None) -> list:
+    try:
+        q = (db.table("bot_items").select("*")
+               .eq("chat_id", str(chat_id)).eq("is_active", True))
+        if kind:
+            q = q.eq("type", kind)
+        return q.order("id").execute().data or []
+    except Exception as e:
+        log.error(f"db_get: {e}")
+        return []
 
 def db_off(item_id, chat_id):
-    (db.table("bot_items")
-       .update({"is_active": False})
-       .eq("id", item_id)
-       .eq("chat_id", str(chat_id))
-       .execute())
+    try:
+        (db.table("bot_items").update({"is_active": False})
+           .eq("id", item_id).eq("chat_id", str(chat_id)).execute())
+    except Exception as e:
+        log.error(f"db_off: {e}")
 
-def db_due(hour, minute):
-    return (db.table("bot_items").select("*")
-              .eq("is_active", True)
-              .eq("remind_hour", hour)
-              .eq("remind_minute", minute)
-              .execute().data or [])
+def db_due(hour, minute) -> list:
+    try:
+        return (db.table("bot_items").select("*")
+                  .eq("is_active", True)
+                  .eq("remind_hour", hour)
+                  .eq("remind_minute", minute)
+                  .execute().data or [])
+    except Exception as e:
+        log.error(f"db_due: {e}")
+        return []
 
 def db_mark_sent(item_id: int, sent_date: str):
-    (db.table("bot_items")
-       .update({"last_sent_date": sent_date})
-       .eq("id", item_id)
-       .execute())
+    try:
+        (db.table("bot_items").update({"last_sent_date": sent_date})
+           .eq("id", item_id).execute())
+    except Exception as e:
+        log.error(f"db_mark_sent: {e}")
 
-# ── bot_memory (постоянная память о пользователе) ──────────────
-MEM_LIMIT = 480  # макс символов памяти
+# ── Память (bot_memory) ────────────────────────────────────────
+MEM_MAX = 500
 
 def mem_load(chat_id: int) -> str:
-    """Загружает факты о пользователе из БД."""
     try:
-        r = db.table("bot_memory").select("facts").eq("chat_id", str(chat_id)).execute()
-        if r.data:
-            return (r.data[0].get("facts") or "").strip()
-    except Exception as e:
-        log.error(f"mem_load: {e}")
-    return ""
+        r = (db.table("bot_memory").select("facts")
+               .eq("chat_id", str(chat_id)).execute())
+        return (r.data[0].get("facts") or "").strip() if r.data else ""
+    except Exception:
+        return ""  # таблица ещё не создана — ок
 
 def mem_save(chat_id: int, facts: str):
-    """Сохраняет обновлённые факты."""
     try:
         (db.table("bot_memory")
-           .upsert({"chat_id": str(chat_id), "facts": facts[:MEM_LIMIT],
+           .upsert({"chat_id": str(chat_id), "facts": facts[:MEM_MAX],
                     "updated_at": datetime.now(TZ).isoformat()})
            .execute())
     except Exception as e:
         log.error(f"mem_save: {e}")
 
-def mem_add_fact(chat_id: int, new_fact: str):
-    """Добавляет новый факт в память, не дублируя существующий."""
-    current = mem_load(chat_id)
-    if new_fact.lower().strip() in current.lower():
-        return  # уже есть
-    updated = (current + "\n" + new_fact).strip()
-    if len(updated) > MEM_LIMIT:
-        # Удаляем старейшие строки
+def mem_add_fact(chat_id: int, fact: str):
+    cur = mem_load(chat_id)
+    if fact.lower().strip() in cur.lower():
+        return
+    updated = (cur + "\n" + fact).strip()
+    if len(updated) > MEM_MAX:
         lines = updated.split("\n")
-        while len("\n".join(lines)) > MEM_LIMIT and lines:
+        while len("\n".join(lines)) > MEM_MAX and lines:
             lines.pop(0)
         updated = "\n".join(lines)
     mem_save(chat_id, updated)
@@ -178,50 +227,43 @@ def mem_add_fact(chat_id: int, new_fact: str):
 def mem_clear(chat_id: int):
     mem_save(chat_id, "")
 
-# ── soft_tasks (мягкие напоминания каждые ~8 часов) ────────────
+# ── Мягкие задачи (напоминают в ответах каждые ~8 ч) ──────────
 def _hour_block(dt: datetime) -> str:
-    """Блок из 3 в день: 0, 8, 16."""
-    if dt.hour < 8:   b = 0
-    elif dt.hour < 16: b = 8
-    else:              b = 16
+    b = 0 if dt.hour < 8 else (8 if dt.hour < 16 else 16)
     return f"{dt.strftime('%Y-%m-%d')}-{b}"
 
-def soft_task_add(chat_id: int, text: str):
+def soft_add(chat_id: int, text: str):
     db_add(chat_id, "soft_task", text)
 
-def soft_task_get_pending(chat_id: int) -> list[str]:
-    """
-    Возвращает soft_tasks, для которых прошёл новый 8-часовой блок.
-    Обновляет last_reminded в БД.
-    """
-    now   = datetime.now(TZ)
-    block = _hour_block(now)
-
-    items = db.table("bot_items").select("*") \
-              .eq("chat_id", str(chat_id)) \
-              .eq("type", "soft_task") \
-              .eq("is_active", True) \
-              .execute().data or []
-
-    pending = []
-    for item in items:
-        last = item.get("last_reminded") or ""
-        if last != block:
-            pending.append(item["text"])
-            try:
-                db.table("bot_items").update({"last_reminded": block}) \
-                  .eq("id", item["id"]).execute()
-            except Exception:
-                pass
-    return pending
+def soft_pending(chat_id: int) -> list[str]:
+    try:
+        block = _hour_block(datetime.now(TZ))
+        items = (db.table("bot_items").select("*")
+                   .eq("chat_id", str(chat_id))
+                   .eq("type", "soft_task")
+                   .eq("is_active", True)
+                   .execute().data or [])
+        out = []
+        for it in items:
+            if (it.get("last_reminded") or "") != block:
+                out.append(it["text"])
+                try:
+                    db.table("bot_items").update({"last_reminded": block}) \
+                      .eq("id", it["id"]).execute()
+                except Exception:
+                    pass
+        return out
+    except Exception as e:
+        log.error(f"soft_pending: {e}")
+        return []
 
 # ══════════════════════════════════════════════════════════════
-#  REGEX PRE-PARSER (страховка на случай сбоя AI)
+#  ПАРСЕР — keyword-first, AI второй, regex страховка
 # ══════════════════════════════════════════════════════════════
+
 def _regex_hints(text: str) -> dict:
     result = {}
     t = text.lower()
-
     if m := re.search(r'\bв\s+(\d{1,2}):(\d{2})\b', t):
         result["hour"], result["minute"] = int(m.group(1)), int(m.group(2))
     elif m := re.search(r'\bв\s+(\d{1,2})\s+ч(?:ас|\.)?', t):
@@ -243,47 +285,83 @@ def _regex_hints(text: str) -> dict:
         result["interval_days"], result["is_daily"] = n, True
     elif re.search(r'каждый\s+день|ежедневно', t):
         result["interval_days"], result["is_daily"] = 1, True
-
     return result
 
-# ══════════════════════════════════════════════════════════════
-#  AI — ОСНОВНЫЕ ФУНКЦИИ (google-genai, gemini-3.5-flash)
-# ══════════════════════════════════════════════════════════════
 
-PARSE_SYSTEM = """\
-Ты — точный парсер команд для Telegram-бота.
-Анализируй сообщение и возвращай ТОЛЬКО валидный JSON.
+def _keyword_intent(text: str) -> str | None:
+    """Быстрое определение действия по ключевым словам. Не зависит от AI."""
+    t = text.lower()
+    if re.search(r'\bнапомни\b|\bнапоминай\b', t):
+        return "add_reminder"
+    if re.search(r'\bсоставь\s+план|\bпланируй\b|\bплан\s+на\s+день\b', t):
+        return "make_plan"
+    if re.search(r'\bсписок\b|покажи.*задач|что\s+у\s+меня\s+есть', t):
+        return "list"
+    if re.search(r'\bудали\b|\bубери\b', t) and re.search(r'\d+', t):
+        return "delete"
+    if re.search(r'\bзапомни\b|\bзапиши\b', t):
+        if re.search(
+            r'меня зовут|мой стиль|обращайся|я учусь|я работаю|я живу|'
+            r'я хочу чтобы ты|общайся\s+(со мной|без|по)|говори\s+мне|'
+            r'ко мне|моё имя', t
+        ):
+            return "add_memory"
+        if re.search(
+            r'\bнужно\b|\bнадо\b|\bдолжен\b|\bсрок\b|'
+            r'на\s+(понедельник|вторник|среду|четверг|пятниц|суббот|воскресен|следующ)', t
+        ):
+            return "add_soft_task"
+        return "add_note"
+    if re.search(r'не\s+забудь\s+напомнить|напомни\s+позже', t):
+        return "add_soft_task"
+    if re.search(r'моя\s+память|что\s+ты\s+помнишь|покажи\s+память', t):
+        return "show_memory"
+    if re.search(r'забудь\s+всё|очисти\s+память|удали\s+память', t):
+        return "clear_memory"
+    if re.search(r'присылай\s+цитат|настрой\s+цитат', t):
+        return "set_quote"
+    return None
 
-Действия:
-• add_reminder  — напомнить в конкретное время
-• add_note      — заметка без времени ("запомни", "запиши")
-• add_habit     — регулярная привычка ("хочу каждый день X")
-• add_memory    — запомнить ФАКТ о пользователе или стиль общения
-                  ("запомни что меня зовут", "обращайся ко мне на ты",
-                   "запомни что я учусь в...", "общайся без воды")
-• add_soft_task — задача с дедлайном, напоминать каждые ~8 ч в ответах
-                  ("запомни что нужно сделать ДЗ на среду",
-                   "не забудь напомнить мне купить...", "напомни позже про...")
-• make_plan     — составить план на день
-• show_memory   — показать память ("что ты помнишь", "моя память", "/memory")
-• clear_memory  — очистить память ("забудь всё", "/forget")
-• list          — список задач
-• delete        — удалить задачу
-• set_quote     — ежедневные цитаты
-• chat          — разговор, вопросы, всё остальное
 
-ВАЖНО: "запомни что нужно X" → add_soft_task (задача)
-        "запомни что я / меня зовут / мой стиль / обращайся..." → add_memory (факт)
+def _extract_text(action: str, raw: str) -> str:
+    """Убирает служебные слова из текста — оставляет суть."""
+    t = raw
+    if action in ("add_reminder", "add_habit"):
+        t = re.sub(r'напомни(те)?\s*(мне)?\s*', '', t, flags=re.I)
+        t = re.sub(r'напоминай\s*(мне)?\s*', '', t, flags=re.I)
+        t = re.sub(r'каждые?\s+\d+\s+дн\w*', '', t, flags=re.I)
+        t = re.sub(r'через\s+день', '', t, flags=re.I)
+        t = re.sub(r'каждый\s+(второй\s+)?день', '', t, flags=re.I)
+        t = re.sub(r'ежедневно', '', t, flags=re.I)
+        t = re.sub(r'раз\s+в\s+\d+\s+дн\w*', '', t, flags=re.I)
+        t = re.sub(r'в\s+\d{1,2}:\d{2}', '', t, flags=re.I)
+        t = re.sub(r'в\s+\d{1,2}\s+(часов|ч|утра|вечера)', '', t, flags=re.I)
+        t = re.sub(r'в\s+(полдень|полночь)', '', t, flags=re.I)
+    elif action in ("add_note", "add_soft_task"):
+        t = re.sub(r'^запомни\s*(что)?\s*', '', t, flags=re.I)
+        t = re.sub(r'^запиши\s*(что)?\s*', '', t, flags=re.I)
+        t = re.sub(r'^не\s+забудь\s*(что)?\s*', '', t, flags=re.I)
+    elif action == "add_memory":
+        t = re.sub(r'^запомни\s*(что)?\s*', '', t, flags=re.I)
+        t = re.sub(r'^запиши\s*(что)?\s*', '', t, flags=re.I)
+    return t.strip() or raw.strip()
+
+
+PARSE_SYS = """\
+Ты — точный парсер команд. Верни ТОЛЬКО валидный JSON.
+Действия: add_reminder, add_note, add_habit, add_memory, add_soft_task,
+          make_plan, show_memory, clear_memory, list, delete, set_quote, chat.
 """
 
-PARSE_PROMPT = """\
+PARSE_TMPL = """\
 Время: {now}
 Сообщение: "{msg}"
+Текущее действие (определено ключевыми словами): {hint}
 
-JSON:
+JSON-ответ:
 {{
-  "action": "...",
-  "text": "суть кратко",
+  "action": "{hint}",
+  "text": "суть задачи кратко",
   "hour": null,
   "minute": 0,
   "is_daily": false,
@@ -294,183 +372,190 @@ JSON:
   "plan_activities": null
 }}
 
-Время: "в 12:03"→h=12,m=3 | "в 20 часов"→h=20,m=0 | "в 8 вечера"→h=20 | "в полдень"→h=12
+Время: "в 12:03"→h=12,m=3 | "в 20 часов"→h=20 | "в 8 вечера"→h=20 | "в полдень"→h=12
 Интервал: "через день"→2 | "каждые 3 дня"→3 | "каждый день"→1
-По умолчанию: add_reminder без времени→hour=null | add_habit→h=8 | add_note→h=9
-
-add_memory: поле memory_fact = точный факт для сохранения (кратко)
-make_plan: поле plan_activities = что хочет сделать (список через запятую)
+add_memory: поле memory_fact = факт кратко
+make_plan:  поле plan_activities = список дел через запятую
 """
 
-async def ai_parse(text: str) -> dict:
-    """Парсит команду. Возвращает dict с action и параметрами."""
-    now    = datetime.now(TZ).strftime("%H:%M %d.%m.%Y")
-    prompt = PARSE_PROMPT.format(now=now, msg=text)
-    try:
-        resp = await asyncio.to_thread(
-            ai.models.generate_content,
-            model=MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                system_instruction=PARSE_SYSTEM,
-                response_mime_type="application/json",
-                temperature=0.05,
-            )
-        )
-        data = json.loads(resp.text)
 
-        # Regex страховка
-        hints = _regex_hints(text)
-        if hints:
-            act = data.get("action")
-            if act in ("chat", "unknown", None) and hints.get("hour") is not None:
-                if re.search(r'напомни|напоминай', text.lower()):
-                    data["action"] = "add_reminder"
-            if hints.get("hour") is not None and data.get("hour") is None and \
-               data.get("action") in ("add_reminder", "add_habit"):
+async def ai_parse(text: str) -> dict:
+    """Парсит намерение. Keyword-first, AI для параметров, regex страховка."""
+    hints   = _regex_hints(text)
+    keyword = _keyword_intent(text)
+    now     = datetime.now(TZ).strftime("%H:%M %d.%m.%Y")
+
+    # Если keyword + время из regex — можем обойтись без AI
+    if keyword == "add_reminder" and hints.get("hour") is not None:
+        return {
+            "action":        "add_reminder",
+            "text":          _extract_text("add_reminder", text),
+            "hour":          hints["hour"],
+            "minute":        hints.get("minute", 0),
+            "is_daily":      hints.get("is_daily", False),
+            "interval_days": hints.get("interval_days", 1),
+        }
+
+    if keyword in ("list", "show_memory", "clear_memory"):
+        return {"action": keyword}
+
+    if keyword == "delete":
+        m = re.search(r'\d+', text)
+        return {"action": "delete", "delete_id": int(m.group()) if m else None}
+
+    # Для остальных — AI для извлечения параметров
+    prompt = PARSE_TMPL.format(now=now, msg=text, hint=keyword or "chat")
+    try:
+        raw  = await asyncio.to_thread(_call, prompt, PARSE_SYS, True, 0.05)
+        data = json.loads(raw)
+
+        # Доверяем keyword-паттерну больше, чем AI
+        if keyword and data.get("action") in ("chat", "unknown", None):
+            data["action"] = keyword
+
+        # Страховка regex для времени
+        if hints.get("hour") is not None and data.get("hour") is None:
+            if data.get("action") in ("add_reminder", "add_habit"):
                 data["hour"]   = hints["hour"]
                 data["minute"] = hints.get("minute", 0)
-            if hints.get("interval_days", 1) > 1 and data.get("interval_days", 1) <= 1:
-                data["interval_days"] = hints["interval_days"]
-                data["is_daily"]      = True
-            if hints.get("is_daily") and not data.get("is_daily"):
-                data["is_daily"] = True
+        if hints.get("interval_days", 1) > 1 and data.get("interval_days", 1) <= 1:
+            data["interval_days"] = hints["interval_days"]
+            data["is_daily"]      = True
+        if hints.get("is_daily") and not data.get("is_daily"):
+            data["is_daily"] = True
+
         return data
+
     except Exception as e:
         log.error(f"ai_parse: {e}")
-        hints = _regex_hints(text)
+        # Полный fallback на keyword + regex
+        if keyword:
+            return {
+                "action":        keyword,
+                "text":          _extract_text(keyword, text),
+                "hour":          hints.get("hour"),
+                "minute":        hints.get("minute", 0),
+                "is_daily":      hints.get("is_daily", False),
+                "interval_days": hints.get("interval_days", 1),
+            }
         if hints.get("hour") is not None:
             return {
                 "action": "add_reminder",
-                "text": text.strip(),
-                "hour": hints["hour"], "minute": hints.get("minute", 0),
+                "text":   text.strip(),
+                "hour":   hints["hour"], "minute": hints.get("minute", 0),
                 "is_daily": hints.get("is_daily", False),
                 "interval_days": hints.get("interval_days", 1),
             }
         return {"action": "chat"}
 
 
-async def ai_reply(text: str, memory: str, soft_tasks: list[str] = None) -> str:
-    """
-    Ответ на обычное сообщение.
-    Память инжектируется как системный контекст (не история чатов).
-    """
-    system_parts = ["Ты — умный личный ассистент в Telegram. Отвечаешь по-русски."]
+# ══════════════════════════════════════════════════════════════
+#  AI ФУНКЦИИ
+# ══════════════════════════════════════════════════════════════
 
+async def ai_confirm(action_summary: str, memory: str = "") -> str | None:
+    """Короткое живое подтверждение после выполнения действия."""
+    mem_note = f"\n[О пользователе: {memory}]" if memory else ""
+    prompt = (
+        f"Ты ассистент.{mem_note}\n"
+        f"Только что выполнил: {action_summary}\n\n"
+        f"Напиши ОДНО короткое (1–2 предложения) подтверждение на русском. "
+        f"Дружелюбно, без лишних слов."
+    )
+    try:
+        return (await asyncio.to_thread(_call, prompt, None, False, 0.7)).strip()
+    except Exception as e:
+        log.error(f"ai_confirm: {e}")
+        return None
+
+
+async def ai_reply(text: str, memory: str = "",
+                   soft_tasks: list[str] | None = None) -> str | None:
+    """Ответ на обычное сообщение."""
+    sys_parts = ["Ты — умный личный ассистент в Telegram. Отвечай по-русски."]
     if memory:
-        system_parts.append(f"\nЧТО ТЫ ЗНАЕШЬ О ПОЛЬЗОВАТЕЛЕ (следуй этому!):\n{memory}")
-
-    system_parts.append(
-        "\nПравила: следуй инструкциям пользователя из его памяти. "
-        "Отвечай кратко если не просят длинного ответа. "
+        sys_parts.append(
+            f"\nЧТО ТЫ ЗНАЕШЬ О ПОЛЬЗОВАТЕЛЕ (следуй этому):\n{memory}"
+        )
+    sys_parts.append(
+        "\nПравила: следуй инструкциям пользователя из памяти. "
+        "Отвечай кратко если не просят длинного. "
         "Можешь говорить о чём угодно: советовать, объяснять, шутить."
     )
-
     user_msg = text
     if soft_tasks:
-        tasks_str = "\n".join(f"• {t}" for t in soft_tasks)
+        tasks = "\n".join(f"• {t}" for t in soft_tasks)
         user_msg = (
             f"{text}\n\n"
-            f"[Кстати, мягко напомни в конце ответа про эти задачи пользователя:\n"
-            f"{tasks_str}]"
+            f"[Мягко напомни в конце ответа про эти задачи пользователя:\n{tasks}]"
         )
-
     try:
-        resp = await asyncio.to_thread(
-            ai.models.generate_content,
-            model=MODEL,
-            contents=user_msg,
-            config=types.GenerateContentConfig(
-                system_instruction="\n".join(system_parts),
-                temperature=0.75,
-            )
-        )
-        return resp.text.strip()
+        return (await asyncio.to_thread(
+            _call, user_msg, "\n".join(sys_parts), False, 0.75
+        )).strip()
     except Exception as e:
         log.error(f"ai_reply: {e}")
-        return None  # вернём None → fallback сообщение
+        return None
 
 
-async def ai_make_plan(activities: str, memory: str) -> str:
-    """Составляет план на день."""
+async def ai_plan(activities: str, memory: str = "") -> str | None:
     now = datetime.now(TZ)
-    mem_note = f"О пользователе: {memory}\n\n" if memory else ""
-
     prompt = (
-        f"{mem_note}"
+        f"{'О пользователе: ' + memory + chr(10) if memory else ''}"
         f"Сейчас: {now.strftime('%H:%M, %d.%m.%Y')}\n"
         f"Пользователь хочет сегодня: {activities}\n\n"
         f"Составь умный план на оставшийся день с временны́ми слотами. "
-        f"Расставь дела в правильном порядке, учти перерывы и естественный ритм дня. "
-        f"Формат каждой строки: 🕒 ЧЧ:ММ — Дело (краткий комментарий)\n"
-        f"В конце одна строка с мотивационным итогом.\n"
-        f"Будь конкретным, без лишних слов."
+        f"Расставь дела в правильном порядке, учти перерывы. "
+        f"Формат: 🕒 ЧЧ:ММ — Дело (краткий комментарий)\n"
+        f"В конце — одна мотивационная строка. Без лишних слов."
     )
     try:
-        resp = await asyncio.to_thread(
-            ai.models.generate_content,
-            model=MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(temperature=0.6)
-        )
-        return resp.text.strip()
+        return (await asyncio.to_thread(_call, prompt, None, False, 0.6)).strip()
     except Exception as e:
-        log.error(f"ai_make_plan: {e}")
+        log.error(f"ai_plan: {e}")
         return None
 
 
 async def ai_quote(example: str) -> str:
-    """Генерирует вдохновляющую цитату."""
     prompt = (
         f'Создай вдохновляющую цитату на русском в стиле: "{example}". '
-        "Верни ТОЛЬКО текст цитаты, без автора и кавычек."
+        "Верни ТОЛЬКО текст, без автора и кавычек."
     )
     try:
-        resp = await asyncio.to_thread(
-            ai.models.generate_content,
-            model=MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(temperature=0.9)
-        )
-        return resp.text.strip().strip('"\'')
+        return (await asyncio.to_thread(_call, prompt, None, False, 0.9)).strip().strip("\"'")
     except Exception as e:
         log.error(f"ai_quote: {e}")
         return "Каждый день — новый шанс стать лучше!"
 
-
 # ══════════════════════════════════════════════════════════════
-#  ПЛАНИРОВЩИК (жёсткие напоминания)
+#  ПЛАНИРОВЩИК
 # ══════════════════════════════════════════════════════════════
 async def tick(bot):
-    """Каждую минуту — рассылает ❗ напоминания с учётом interval_days."""
     now     = datetime.now(TZ)
     today_s = now.strftime("%Y-%m-%d")
     today_d = now.date()
-    items   = db_due(now.hour, now.minute)
 
-    for item in items:
+    for item in db_due(now.hour, now.minute):
         if item.get("type") == "soft_task":
-            continue  # soft_tasks не через планировщик
+            continue
 
         interval  = int(item.get("interval_days") or 1)
         last_sent = item.get("last_sent_date")
-
         if last_sent and interval > 1:
             try:
-                last_d     = datetime.strptime(str(last_sent)[:10], "%Y-%m-%d").date()
-                days_since = (today_d - last_d).days
-                if days_since < interval:
+                last_d = datetime.strptime(str(last_sent)[:10], "%Y-%m-%d").date()
+                if (today_d - last_d).days < interval:
                     continue
             except Exception:
                 pass
 
         cid = int(item["chat_id"])
+        t   = item.get("type", "")
         try:
-            t = item["type"]
             if t == "reminder":
                 await bot.send_message(cid, f"❗ Напоминание: {item['text']}")
                 db_mark_sent(item["id"], today_s)
-                if not item["is_daily"]:
+                if not item.get("is_daily"):
                     db_off(item["id"], cid)
             elif t == "note":
                 await bot.send_message(cid, f"❗ Не забудь: {item['text']}")
@@ -480,48 +565,38 @@ async def tick(bot):
                 db_mark_sent(item["id"], today_s)
             elif t == "quote_config":
                 q = await ai_quote(item["text"])
-                await bot.send_message(
-                    cid, f"✨ *Цитата дня:*\n\n{q}", parse_mode="Markdown"
-                )
+                await bot.send_message(cid, f"✨ *Цитата дня:*\n\n{q}", parse_mode="Markdown")
                 db_mark_sent(item["id"], today_s)
         except Exception as e:
             log.error(f"tick item {item.get('id')}: {e}")
 
-
 # ──────────────── КЛАВИАТУРА ───────────────────────────────────
-def main_keyboard() -> InlineKeyboardMarkup:
+def kbd() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("📋 Задачи",    callback_data="list"),
-            InlineKeyboardButton("☀️ Сегодня",   callback_data="today"),
-        ],
-        [
-            InlineKeyboardButton("🧠 Память",    callback_data="memory"),
-            InlineKeyboardButton("📅 План дня",  callback_data="plan"),
-        ],
-        [
-            InlineKeyboardButton("✨ Цитата",    callback_data="quote"),
-            InlineKeyboardButton("📖 Помощь",    callback_data="help"),
-        ],
+        [InlineKeyboardButton("📋 Задачи",   callback_data="list"),
+         InlineKeyboardButton("☀️ Сегодня",  callback_data="today")],
+        [InlineKeyboardButton("🧠 Память",   callback_data="memory"),
+         InlineKeyboardButton("📅 План дня", callback_data="plan")],
+        [InlineKeyboardButton("✨ Цитата",   callback_data="quote"),
+         InlineKeyboardButton("📖 Помощь",   callback_data="help")],
     ])
 
+FALLBACK = "❌ Бот не смог ответить. Попробуй ещё раз."
 
-# ────────────────────── ТЕКСТЫ ─────────────────────────────────
 WELCOME = (
-    "👋 Привет! Я твой личный ассистент на Gemini 3.5 Flash.\n\n"
+    "👋 Привет! Я твой личный ассистент.\n\n"
     "Умею:\n"
     "❗ Напоминать в нужное время\n"
     "🧠 Запоминать факты о тебе и стиль общения\n"
     "📅 Составлять план на день\n"
-    "📝 Хранить заметки и мягко напоминать про дедлайны\n"
-    "💪 Следить за привычками\n"
+    "📌 Мягко напоминать про дедлайны\n"
     "💬 Просто разговаривать\n\n"
     "*Примеры:*\n"
     "• _Напомни в 12:03 выпить воды_\n"
     "• _Напоминай каждые 2 дня в 20:00 откачать воду_\n"
-    "• _Запомни что меня зовут Павел, обращайся дружески_\n"
-    "• _Запомни что нужно сделать ДЗ на среду_\n"
-    "• _Составь план: отжаться, погулять, сходить в магазин_\n"
+    "• _Запомни что меня зовут Павел, общайся дружески_\n"
+    "• _Запомни что нужно ДЗ на среду_\n"
+    "• _Составь план: отжаться, погулять, магазин_\n"
 )
 
 HELP_TEXT = (
@@ -530,40 +605,30 @@ HELP_TEXT = (
     "— Напомни в 12:03 выпить воды\n"
     "— Напоминай каждые 2 дня в 20:00 откачать воду\n"
     "— Каждый день в 7 утра о пробежке\n\n"
-    "🧠 *Память (постоянные факты):*\n"
+    "🧠 *Память (постоянно):*\n"
     "— Запомни что меня зовут Павел\n"
-    "— Обращайся ко мне на ты, без воды\n"
-    "— Запомни что я учусь на третьем курсе в Польше\n"
-    "— /memory — посмотреть память\n"
-    "— /forget — очистить память\n\n"
-    "📋 *Мягкие задачи (напомнит в ответах каждые ~8ч):*\n"
-    "— Запомни что нужно сдать отчёт в пятницу\n"
-    "— Не забудь напомнить купить подарок маме\n\n"
+    "— Обращайся ко мне без воды\n"
+    "— Запомни что я учусь на 3 курсе в Польше\n"
+    "— /memory — посмотреть  |  /forget — очистить\n\n"
+    "📌 *Мягкие задачи (~каждые 8ч в ответах):*\n"
+    "— Запомни что нужно сдать отчёт в пятницу\n\n"
     "📅 *План дня:*\n"
-    "— Составь план: поотжиматься, погулять, магазин\n"
-    "— /plan — быстрый план дня\n\n"
-    "📝 *Заметки* (каждый день в 9:00):\n"
+    "— Составь план: отжаться, погулять, магазин\n\n"
+    "📝 *Заметки (каждый день в 9:00):*\n"
     "— Запомни купить краску\n\n"
-    "💬 *Общение:*\n"
-    "— Как дела? / Что думаешь о...?\n\n"
-    "📋 /list — список задач\n"
-    "☀️ /today — план на сегодня\n"
+    "📋 /list — все задачи\n"
+    "☀️ /today — на сегодня\n"
     "✨ /quote — цитата\n"
     "🗑 /delete [номер] — удалить\n"
     "🔑 /myid — мой Telegram ID\n"
 )
 
-FALLBACK = "❌ Бот не смог ответить на это сообщение. Попробуй ещё раз."
-
-
 # ══════════════════════════════════════════════════════════════
-#  ОБРАБОТЧИКИ КОМАНД
+#  КОМАНДЫ
 # ══════════════════════════════════════════════════════════════
 async def cmd_start(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await check_access(u): return
-    await u.effective_message.reply_text(
-        WELCOME, parse_mode="Markdown", reply_markup=main_keyboard()
-    )
+    await u.effective_message.reply_text(WELCOME, parse_mode="Markdown", reply_markup=kbd())
 
 async def cmd_help(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await check_access(u): return
@@ -571,75 +636,64 @@ async def cmd_help(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_menu(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await check_access(u): return
-    await u.effective_message.reply_text("Выбери:", reply_markup=main_keyboard())
+    await u.effective_message.reply_text("Выбери:", reply_markup=kbd())
 
 async def cmd_myid(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = u.effective_user
     await u.effective_message.reply_text(
         f"🔑 *Твой Telegram ID:*\n`{user.id}`\n\n"
         f"Имя: {user.first_name or '—'}\nUsername: @{user.username or '—'}",
-        parse_mode="Markdown"
+        parse_mode="Markdown",
     )
 
 async def cmd_memory(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await check_access(u): return
-    cid   = u.effective_chat.id
-    facts = mem_load(cid)
+    facts = mem_load(u.effective_chat.id)
     if not facts:
         await u.effective_message.reply_text(
-            "🧠 Память пуста.\n\n"
-            "Попробуй написать: _Запомни что меня зовут Паша_",
-            parse_mode="Markdown"
+            "🧠 Память пуста.\n\n_Пример: Запомни что меня зовут Паша_",
+            parse_mode="Markdown",
         )
         return
     await u.effective_message.reply_text(
-        f"🧠 *Моя память о тебе:*\n\n{facts}\n\n"
-        f"_Удалить всё: /forget_",
-        parse_mode="Markdown"
+        f"🧠 *Моя память о тебе:*\n\n{facts}\n\n_Удалить: /forget_",
+        parse_mode="Markdown",
     )
 
 async def cmd_forget(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await check_access(u): return
-    cid = u.effective_chat.id
-    mem_clear(cid)
+    mem_clear(u.effective_chat.id)
     await u.effective_message.reply_text("🧹 Память очищена.")
 
 async def cmd_plan(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await check_access(u): return
-    cid  = u.effective_chat.id
-    mem  = mem_load(cid)
-    await u.effective_message.reply_chat_action("typing")
-    plan = await ai_make_plan("напомни что хочу сделать сегодня (спроси у пользователя)", mem)
-    if plan is None:
-        await u.effective_message.reply_text(FALLBACK)
-        return
     await u.effective_message.reply_text(
-        "📅 *Напиши что хочешь сделать сегодня и я составлю план.*\n"
-        "_Пример: составь план — поотжиматься, погулять, сходить в технику_",
-        parse_mode="Markdown"
+        "📅 Напиши что хочешь сделать сегодня и я составлю план.\n"
+        "_Пример: составь план — поотжиматься, погулять, магазин_",
+        parse_mode="Markdown",
     )
 
 async def cmd_list(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await check_access(u): return
     cid   = u.effective_chat.id
-    items = [i for i in db_get(cid) if i.get("type") != "soft_task"]
-    if not items:
+    all_  = db_get(cid)
+    items = [i for i in all_ if i.get("type") != "soft_task"]
+    soft  = [i for i in all_ if i.get("type") == "soft_task"]
+
+    if not items and not soft:
         await u.effective_message.reply_text("Задач пока нет 😊")
         return
 
     groups = {
-        "reminder":     ("❗ Напоминания",  []),
-        "habit":        ("💪 Привычки",     []),
-        "note":         ("📝 Заметки",      []),
-        "quote_config": ("✨ Цитаты",       []),
+        "reminder":     ("❗ Напоминания", []),
+        "habit":        ("💪 Привычки",    []),
+        "note":         ("📝 Заметки",     []),
+        "quote_config": ("✨ Цитаты",      []),
     }
     for it in items:
         k = it.get("type", "reminder")
         if k in groups:
             groups[k][1].append(it)
-
-    # Soft tasks отдельно
-    soft = db_get(cid, "soft_task")
 
     lines = ["📋 *Твои задачи:*\n"]
     for _, (label, grp) in groups.items():
@@ -647,11 +701,11 @@ async def cmd_list(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         lines.append(f"*{label}:*")
         for it in grp:
             h  = it.get("remind_hour")
-            m  = it.get("remind_minute", 0)
+            m_ = it.get("remind_minute", 0)
             iv = int(it.get("interval_days") or 1)
-            ts = f" _{h:02d}:{m:02d}_" if h is not None else ""
-            ds = (f" _(каждые {iv} дн.)_" if iv > 1 else
-                  " _(ежедн.)_" if it.get("is_daily") else "")
+            ts = f" _{h:02d}:{m_:02d}_" if h is not None else ""
+            ds = (f" _(каждые {iv} дн.)_" if iv > 1
+                  else " _(ежедн.)_" if it.get("is_daily") else "")
             lines.append(f"  `{it['id']}` — {it['text']}{ts}{ds}")
         lines.append("")
 
@@ -671,86 +725,73 @@ async def cmd_today(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not items:
         await u.effective_message.reply_text("Задач нет. Отличный день! ☀️")
         return
-
-    now   = datetime.now(TZ)
-    emoji = {"reminder": "❗", "habit": "💪", "note": "📝", "quote_config": "✨"}
-    timed = sorted(
-        [i for i in items if i.get("remind_hour") is not None],
-        key=lambda x: (x["remind_hour"], x.get("remind_minute", 0))
-    )
+    now_   = datetime.now(TZ)
+    emj    = {"reminder":"❗","habit":"💪","note":"📝","quote_config":"✨"}
+    timed  = sorted([i for i in items if i.get("remind_hour") is not None],
+                    key=lambda x: (x["remind_hour"], x.get("remind_minute", 0)))
     untimed = [i for i in items if i.get("remind_hour") is None]
-
-    lines = [f"☀️ *План на {now.strftime('%d.%m.%Y')}:*\n"]
+    lines  = [f"☀️ *План на {now_.strftime('%d.%m.%Y')}:*\n"]
     for it in timed:
-        h, m = it["remind_hour"], it.get("remind_minute", 0)
-        iv   = int(it.get("interval_days") or 1)
-        e    = emoji.get(it["type"], "•")
-        sfx  = f" _(каждые {iv} дн.)_" if iv > 1 else ""
-        lines.append(f"{e} *{h:02d}:{m:02d}* — {it['text']}{sfx}")
+        h, m_ = it["remind_hour"], it.get("remind_minute", 0)
+        iv     = int(it.get("interval_days") or 1)
+        sfx    = f" _(каждые {iv} дн.)_" if iv > 1 else ""
+        lines.append(f"{emj.get(it['type'],'•')} *{h:02d}:{m_:02d}* — {it['text']}{sfx}")
     if untimed:
         lines.append("\n📌 *Без времени:*")
         for it in untimed:
-            lines.append(f"  {emoji.get(it['type'],'•')} {it['text']}")
+            lines.append(f"  {emj.get(it['type'],'•')} {it['text']}")
     await u.effective_message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 async def cmd_delete(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await check_access(u): return
-    cid  = u.effective_chat.id
     args = ctx.args
     if not args or not args[0].isdigit():
         await u.effective_message.reply_text(
             "Укажи номер: `/delete 5`\nСписок: /list", parse_mode="Markdown"
         )
         return
-    db_off(int(args[0]), cid)
+    db_off(int(args[0]), u.effective_chat.id)
     await u.effective_message.reply_text(f"✅ Задача #{args[0]} удалена!")
 
 async def cmd_quote(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await check_access(u): return
-    cid     = u.effective_chat.id
-    configs = db_get(cid, "quote_config")
-    example = configs[0]["text"] if configs else "Каждый день — шанс стать лучше"
+    cid  = u.effective_chat.id
+    cfgs = db_get(cid, "quote_config")
+    ex   = cfgs[0]["text"] if cfgs else "Каждый день — шанс стать лучше"
     await u.effective_message.reply_chat_action("typing")
-    q = await ai_quote(example)
-    await u.effective_message.reply_text(
-        f"✨ *Цитата:*\n\n{q}", parse_mode="Markdown"
-    )
+    q = await ai_quote(ex)
+    await u.effective_message.reply_text(f"✨ *Цитата:*\n\n{q}", parse_mode="Markdown")
 
 # ─────────────── CALLBACK ─────────────────────────────────────
-async def handle_callback(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = u.callback_query
-    await query.answer()
-
-    if query.data == "myid":
+async def on_callback(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = u.callback_query
+    await q.answer()
+    d = q.data
+    if d == "myid":
         await cmd_myid(u, ctx); return
     if not await check_access(u): return
-
-    dispatch = {
-        "list":   cmd_list,
-        "today":  cmd_today,
-        "quote":  cmd_quote,
-        "help":   cmd_help,
-        "memory": cmd_memory,
-        "plan":   cmd_plan,
-    }
-    handler = dispatch.get(query.data)
-    if handler:
-        await handler(u, ctx)
+    dispatch = {"list": cmd_list, "today": cmd_today, "quote": cmd_quote,
+                "help": cmd_help, "memory": cmd_memory, "plan": cmd_plan}
+    fn = dispatch.get(d)
+    if fn:
+        await fn(u, ctx)
 
 # ══════════════════════════════════════════════════════════════
-#  ГЛАВНЫЙ ОБРАБОТЧИК СООБЩЕНИЙ
+#  ГЛАВНЫЙ ОБРАБОТЧИК
 # ══════════════════════════════════════════════════════════════
-async def handle_msg(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def on_msg(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await check_access(u): return
 
     cid  = u.effective_chat.id
     text = u.message.text
     await u.message.reply_chat_action("typing")
 
-    # Парсим намерение
+    # Загружаем память один раз
+    memory = mem_load(cid)
+
     intent        = await ai_parse(text)
     action        = intent.get("action") or "chat"
-    content       = (intent.get("text") or "").strip() or text.strip()
+    content       = (intent.get("text") or "").strip() or _extract_text(action, text)
     hour          = intent.get("hour")
     minute        = int(intent.get("minute") or 0)
     daily         = bool(intent.get("is_daily", False))
@@ -759,26 +800,34 @@ async def handle_msg(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # ── Напоминание ──────────────────────────────────────────────
     if action == "add_reminder":
         if hour is None:
+            reply = await ai_confirm(
+                "пользователь хочет добавить напоминание, но не указал время — "
+                "спроси его дружелюбно в какое время", memory
+            )
             await u.message.reply_text(
-                "❓ В какое время напомнить?\n"
-                "_Пример: Напомни в 18:00 почистить зубы_",
-                parse_mode="Markdown"
+                reply or "❓ В какое время напомнить?\n"
+                         "_Пример: Напомни в 18:00 почистить зубы_",
+                parse_mode="Markdown",
             )
             return
         db_add(cid, "reminder", content, int(hour), minute, daily, interval_days)
-        freq = (f"каждые {interval_days} дн." if interval_days > 1 else
-                "каждый день" if daily else "один раз")
+        freq = (f"каждые {interval_days} дн." if interval_days > 1
+                else "каждый день" if daily else "один раз")
+        reply = await ai_confirm(
+            f"добавил напоминание '{content}' в {int(hour):02d}:{minute:02d} ({freq})", memory
+        )
         await u.message.reply_text(
-            f"✅ Запомнил!\n⏰ *{int(hour):02d}:{minute:02d}* — {freq}\n📌 _{content}_",
-            parse_mode="Markdown"
+            reply or f"✅ Напомню в *{int(hour):02d}:{minute:02d}* ({freq}):\n_{content}_",
+            parse_mode="Markdown",
         )
 
     # ── Заметка ──────────────────────────────────────────────────
     elif action == "add_note":
         db_add(cid, "note", content, 9, 0, True)
+        reply = await ai_confirm(f"добавил заметку '{content}', напомню каждый день в 9:00", memory)
         await u.message.reply_text(
-            f"📝 Записал! Буду напоминать каждый день в *9:00*:\n_{content}_",
-            parse_mode="Markdown"
+            reply or f"📝 Записал! Напомню каждый день в *9:00*:\n_{content}_",
+            parse_mode="Markdown",
         )
 
     # ── Привычка ─────────────────────────────────────────────────
@@ -786,30 +835,38 @@ async def handle_msg(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         h = int(hour or 8)
         db_add(cid, "habit", content, h, minute, True, interval_days)
         freq = f"каждые {interval_days} дн." if interval_days > 1 else "каждый день"
+        reply = await ai_confirm(
+            f"добавил привычку '{content}' в {h:02d}:{minute:02d} ({freq})", memory
+        )
         await u.message.reply_text(
-            f"💪 Привычка добавлена!\n⏰ *{h:02d}:{minute:02d}* — {freq}\n📌 _{content}_",
-            parse_mode="Markdown"
+            reply or f"💪 Привычка добавлена! {freq.capitalize()} в *{h:02d}:{minute:02d}*:\n_{content}_",
+            parse_mode="Markdown",
         )
 
-    # ── Память — новый факт ───────────────────────────────────────
+    # ── Память — факт ─────────────────────────────────────────────
     elif action == "add_memory":
         fact = (intent.get("memory_fact") or content).strip()
         if fact:
             mem_add_fact(cid, fact)
+            # Обновляем локальную memory
+            memory = mem_load(cid)
+            reply = await ai_confirm(f"запомнил факт о пользователе: '{fact}'", memory)
             await u.message.reply_text(
-                f"🧠 Запомнил!\n_{fact}_\n\nПосмотреть всё: /memory",
-                parse_mode="Markdown"
+                reply or f"🧠 Запомнил!\n_{fact}_\n\nПосмотреть: /memory",
+                parse_mode="Markdown",
             )
         else:
-            await u.message.reply_text("🤔 Не понял что запомнить. Попробуй точнее.")
+            await u.message.reply_text("🤔 Не понял что запомнить. Попробуй ещё раз.")
 
-    # ── Мягкая задача (periodic reminder) ───────────────────────
+    # ── Мягкая задача ────────────────────────────────────────────
     elif action == "add_soft_task":
-        soft_task_add(cid, content)
+        soft_add(cid, content)
+        reply = await ai_confirm(
+            f"запомнил задачу '{content}', буду напоминать каждые ~8 часов в ответах", memory
+        )
         await u.message.reply_text(
-            f"📌 Запомнил задачу!\n_{content}_\n\n"
-            f"Буду мягко напоминать тебе об этом раз в ~8 часов в ответах.",
-            parse_mode="Markdown"
+            reply or f"📌 Запомнил!\n_{content}_\n\nБуду мягко напоминать в ответах (~8ч).",
+            parse_mode="Markdown",
         )
 
     # ── Показать память ──────────────────────────────────────────
@@ -830,108 +887,88 @@ async def handle_msg(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         did = intent.get("delete_id")
         if did:
             db_off(int(did), cid)
-            await u.message.reply_text(f"✅ Задача #{did} удалена!")
+            reply = await ai_confirm(f"удалил задачу #{did}", memory)
+            await u.message.reply_text(reply or f"✅ Задача #{did} удалена!")
         else:
             await u.message.reply_text(
                 "Укажи номер: _удали номер 5_\nСписок: /list",
-                parse_mode="Markdown"
+                parse_mode="Markdown",
             )
 
     # ── Цитаты ───────────────────────────────────────────────────
     elif action == "set_quote":
-        example = intent.get("quote_example") or content or "Каждый день — новый шанс"
+        ex = intent.get("quote_example") or content or "Каждый день — новый шанс"
         for old in db_get(cid, "quote_config"):
             db_off(old["id"], cid)
-        db_add(cid, "quote_config", example, 8, 0, True)
+        db_add(cid, "quote_config", ex, 8, 0, True)
+        reply = await ai_confirm(f"настроил ежедневные цитаты в 8:00 в стиле '{ex}'", memory)
         await u.message.reply_text(
-            f"✨ Буду присылать цитаты каждый день в *8:00*!\nСтиль: _{example}_",
-            parse_mode="Markdown"
+            reply or f"✨ Буду присылать цитаты каждый день в *8:00*!\nСтиль: _{ex}_",
+            parse_mode="Markdown",
         )
 
     # ── План дня ─────────────────────────────────────────────────
     elif action == "make_plan":
         activities = intent.get("plan_activities") or content
-        mem        = mem_load(cid)
-        plan       = await ai_make_plan(activities, mem)
+        plan = await ai_plan(activities, memory)
         if plan is None:
             await u.message.reply_text(FALLBACK)
             return
         await u.message.reply_text(f"📅 *План на сегодня:*\n\n{plan}", parse_mode="Markdown")
 
-    # ── Обычный чат ──────────────────────────────────────────────
+    # ── Чат ──────────────────────────────────────────────────────
     else:
-        mem         = mem_load(cid)
-        soft_tasks  = soft_task_get_pending(cid)
-        reply       = await ai_reply(text, mem, soft_tasks if soft_tasks else None)
-        if reply is None:
-            await u.message.reply_text(FALLBACK)
-            return
-        await u.message.reply_text(reply)
+        soft = soft_pending(cid)
+        reply = await ai_reply(text, memory, soft if soft else None)
+        await u.message.reply_text(reply or FALLBACK)
 
 
-# ──────────────── РЕГИСТРАЦИЯ КОМАНД ──────────────────────────
+# ──────────────────── SETUP ───────────────────────────────────
 async def post_init(app: Application):
     await app.bot.set_my_commands([
-        BotCommand("start",  "👋 Начало работы"),
-        BotCommand("menu",   "📋 Быстрое меню"),
+        BotCommand("start",  "👋 Начало"),
+        BotCommand("menu",   "📋 Меню"),
         BotCommand("list",   "📋 Все задачи"),
-        BotCommand("today",  "☀️ План на сегодня"),
-        BotCommand("plan",   "📅 Составить план дня"),
+        BotCommand("today",  "☀️ На сегодня"),
+        BotCommand("plan",   "📅 Составить план"),
         BotCommand("memory", "🧠 Моя память"),
         BotCommand("forget", "🧹 Очистить память"),
-        BotCommand("quote",  "✨ Получить цитату"),
+        BotCommand("quote",  "✨ Цитата"),
         BotCommand("delete", "🗑 Удалить задачу"),
-        BotCommand("myid",   "🔑 Мой Telegram ID"),
+        BotCommand("myid",   "🔑 Мой ID"),
         BotCommand("help",   "📖 Помощь"),
     ])
-    log.info("✅ Bot commands registered")
-
+    log.info("✅ Commands registered")
 
 # ══════════════════════════════════════════════════════════════
 #  MAIN
 # ══════════════════════════════════════════════════════════════
 async def main():
     threading.Thread(target=start_flask, daemon=True).start()
-    log.info(f"Flask started on :{PORT}")
+    log.info(f"Flask :{PORT}")
 
-    if ALLOWED_USERS:
-        log.info(f"🔒 Restricted to IDs: {ALLOWED_USERS}")
-    else:
-        log.info("🌐 Open to all users")
+    app = (Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build())
 
-    app = (
-        Application.builder()
-        .token(TELEGRAM_TOKEN)
-        .post_init(post_init)
-        .build()
-    )
+    for cmd, fn in [
+        ("start", cmd_start), ("help", cmd_help),   ("menu", cmd_menu),
+        ("myid",  cmd_myid),  ("list", cmd_list),   ("today", cmd_today),
+        ("plan",  cmd_plan),  ("memory", cmd_memory), ("forget", cmd_forget),
+        ("delete",cmd_delete),("quote", cmd_quote),
+    ]:
+        app.add_handler(CommandHandler(cmd, fn))
 
-    app.add_handler(CommandHandler("start",  cmd_start))
-    app.add_handler(CommandHandler("help",   cmd_help))
-    app.add_handler(CommandHandler("menu",   cmd_menu))
-    app.add_handler(CommandHandler("myid",   cmd_myid))
-    app.add_handler(CommandHandler("list",   cmd_list))
-    app.add_handler(CommandHandler("today",  cmd_today))
-    app.add_handler(CommandHandler("plan",   cmd_plan))
-    app.add_handler(CommandHandler("memory", cmd_memory))
-    app.add_handler(CommandHandler("forget", cmd_forget))
-    app.add_handler(CommandHandler("delete", cmd_delete))
-    app.add_handler(CommandHandler("quote",  cmd_quote))
-    app.add_handler(CallbackQueryHandler(handle_callback))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_msg))
+    app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_msg))
 
     sched = AsyncIOScheduler(timezone=TZ)
-    sched.add_job(
-        tick, IntervalTrigger(minutes=1),
-        args=[app.bot], id="tick", max_instances=1
-    )
+    sched.add_job(tick, IntervalTrigger(minutes=1),
+                  args=[app.bot], id="tick", max_instances=1)
     sched.start()
-    log.info("Scheduler started")
 
     await app.initialize()
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
-    log.info(f"✅ Bot running on {MODEL}")
+    log.info(f"✅ Bot running  model={MODEL}")
 
     try:
         await asyncio.Event().wait()
