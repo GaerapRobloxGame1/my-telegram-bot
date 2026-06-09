@@ -1,0 +1,7 @@
+python-telegram-bot>=21.0
+supabase>=2.4.1
+httpx>=0.26.0
+google-genai>=1.0.0
+APScheduler
+Flask
+pytz
