@@ -1,5 +1,5 @@
 # =============================================================
-#  Telegram Personal Assistant Bot — v4.3
+#  Telegram Personal Assistant Bot — v4.2
 #  AI:  Gemini 3.5 Flash
 #  DB:  Supabase
 #
@@ -30,8 +30,7 @@ from datetime import datetime
 import pytz
 
 from telegram import (
-    Update, BotCommand,
-    BotCommandScopeDefault, BotCommandScopeAllPrivateChats,
+    Update, BotCommand, BotCommandScopeAllPrivateChats,
     InlineKeyboardButton, InlineKeyboardMarkup,
     MenuButtonCommands,
 )
@@ -55,22 +54,7 @@ SUPABASE_KEY   = os.environ["SUPABASE_KEY"]
 PORT           = int(os.environ.get("PORT", 5000))
 TIMEZONE       = os.environ.get("TIMEZONE", "Europe/Moscow")
 TZ             = pytz.timezone(TIMEZONE)
-MODEL          = "gemini-2.0-flash"
-
-# ── Контекст разговора (последние N сообщений, in-memory) ─────
-CONV_HISTORY: dict[int, list[dict]] = {}
-HIST_MAX = 15
-
-def hist_add(chat_id: int, role: str, text: str):
-    """Добавить сообщение в историю разговора."""
-    h = CONV_HISTORY.setdefault(chat_id, [])
-    h.append({"role": role, "content": text[:600]})
-    if len(h) > HIST_MAX:
-        CONV_HISTORY[chat_id] = h[-HIST_MAX:]
-
-def hist_get(chat_id: int) -> list[dict]:
-    """Получить историю разговора (без текущего сообщения)."""
-    return list(CONV_HISTORY.get(chat_id, []))
+MODEL          = "gemini-3.5-flash"
 
 # ══════════════════════════════════════════════════════════════
 #  SDK — google-genai (новый) или google-generativeai (старый)
@@ -82,18 +66,10 @@ try:
     _ai = _g.Client(api_key=GEMINI_API_KEY)
 
     def _call(prompt: str, system: str = None,
-              json_mode: bool = False, temp: float = 0.7,
-              history: list[dict] | None = None) -> str:
+              json_mode: bool = False, temp: float = 0.7) -> str:
         kw = {"temperature": temp}
-        sys_final = system or ""
-        if history:
-            hist_lines = [
-                ("Пользователь" if m["role"] == "user" else "Ассистент") + ": " + m["content"]
-                for m in history
-            ]
-            sys_final = sys_final + "\n\n[История разговора]\n" + "\n".join(hist_lines)
-        if sys_final:
-            kw["system_instruction"] = sys_final
+        if system:
+            kw["system_instruction"] = system
         if json_mode:
             kw["response_mime_type"] = "application/json"
         return _ai.models.generate_content(
@@ -108,16 +84,8 @@ except ImportError:
     _g_old.configure(api_key=GEMINI_API_KEY)
 
     def _call(prompt: str, system: str = None,
-              json_mode: bool = False, temp: float = 0.7,
-              history: list[dict] | None = None) -> str:
-        sys_final = system or ""
-        if history:
-            hist_lines = [
-                ("Пользователь" if m["role"] == "user" else "Ассистент") + ": " + m["content"]
-                for m in history
-            ]
-            sys_final = sys_final + "\n\n[История разговора]\n" + "\n".join(hist_lines)
-        full = f"{sys_final}\n\n{prompt}" if sys_final else prompt
+              json_mode: bool = False, temp: float = 0.7) -> str:
+        full = f"{system}\n\n{prompt}" if system else prompt
         try:
             cfg = _g_old.GenerationConfig(
                 temperature=temp,
@@ -215,25 +183,23 @@ def db_mark_sent(item_id: int, sent_date: str):
         log.error(f"db_mark_sent: {e}")
 
 # ── Память ──────────────────────────────────────────────────
-MEM_MAX = 2000
+MEM_MAX = 500
 
 def mem_load(chat_id: int) -> str:
     try:
         r = db.table("bot_memory").select("facts").eq("chat_id", str(chat_id)).execute()
         return (r.data[0].get("facts") or "").strip() if r.data else ""
-    except Exception as e:
-        log.error(f"mem_load: {e}"); return ""
+    except Exception:
+        return ""
 
 def mem_save(chat_id: int, facts: str):
     try:
-        db.table("bot_memory").upsert(
-            {"chat_id": str(chat_id), "facts": facts[:MEM_MAX],
-             "updated_at": datetime.now(TZ).isoformat()},
-            on_conflict="chat_id",
-        ).execute()
-        log.info(f"mem_save OK chat={chat_id} len={len(facts)}")
+        db.table("bot_memory").upsert({
+            "chat_id": str(chat_id), "facts": facts[:MEM_MAX],
+            "updated_at": datetime.now(TZ).isoformat(),
+        }).execute()
     except Exception as e:
-        log.error(f"mem_save ОШИБКА chat={chat_id}: {e}")
+        log.error(f"mem_save: {e}")
 
 def mem_add_fact(chat_id: int, fact: str):
     cur = mem_load(chat_id)
@@ -503,22 +469,19 @@ async def ai_confirm(summary: str, memory: str = "") -> str | None:
         log.error(f"ai_confirm: {e}"); return None
 
 async def ai_reply(text: str, memory: str = "",
-                   soft_tasks: list[str] | None = None,
-                   history: list[dict] | None = None) -> str | None:
+                   soft_tasks: list[str] | None = None) -> str | None:
     sys_parts = ["Ты — умный личный ассистент в Telegram. Отвечай по-русски."]
     if memory:
         sys_parts.append(f"\nЧТО ТЫ ЗНАЕШЬ О ПОЛЬЗОВАТЕЛЕ (следуй этому):\n{memory}")
     sys_parts.append("\nПравила: следуй инструкциям пользователя из памяти. "
-                     "Отвечай кратко если не просят длинного. "
-                     "Если пользователь ссылается на предыдущее сообщение (например 'перенеси', "
-                     "'это', 'то напоминание') — используй историю разговора для понимания контекста.")
+                     "Отвечай кратко если не просят длинного.")
     user_msg = text
     if soft_tasks:
         tasks = "\n".join(f"• {t}" for t in soft_tasks)
         user_msg = f"{text}\n\n[Мягко напомни в конце про задачи:\n{tasks}]"
     try:
         return (await asyncio.to_thread(
-            _call, user_msg, "\n".join(sys_parts), False, 0.75, history
+            _call, user_msg, "\n".join(sys_parts), False, 0.75
         )).strip()
     except Exception as e:
         log.error(f"ai_reply: {e}"); return None
@@ -722,15 +685,15 @@ async def cmd_reminders(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
     lines = ["⏰ *Напоминания:*\n"]
-    for n, it in enumerate(items, 1):
+    for it in items:
         h  = it.get("remind_hour")
         m_ = it.get("remind_minute", 0)
         iv = int(it.get("interval_days") or 1)
         ts = f" _{h:02d}:{m_:02d}_" if h is not None else ""
         ds = (f" _(каждые {iv} дн.)_" if iv > 1
               else " _(ежедн.)_" if it.get("is_daily") else " _(один раз)_")
-        lines.append(f"  {n}. {it['text']}{ts}{ds}  `#{it['id']}`")
-    lines.append("\n_/delete [id] — удалить_")
+        lines.append(f"  `{it['id']}` — {it['text']}{ts}{ds}")
+    lines.append("\n_/delete [номер] — удалить_")
     await u.effective_message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 async def cmd_notes(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -748,9 +711,9 @@ async def cmd_notes(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
     lines = ["📝 *Заметки:*\n_(напоминаю каждый день в 9:00)_\n"]
-    for n, it in enumerate(items, 1):
-        lines.append(f"  {n}. {it['text']}  `#{it['id']}`")
-    lines.append("\n_/delete [id] — удалить_")
+    for it in items:
+        lines.append(f"  `{it['id']}` — {it['text']}")
+    lines.append("\n_/delete [номер] — удалить_")
     await u.effective_message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 async def cmd_habits(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -768,13 +731,13 @@ async def cmd_habits(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
     lines = ["💪 *Привычки:*\n"]
-    for n, it in enumerate(items, 1):
+    for it in items:
         h  = it.get("remind_hour", 8)
         m_ = it.get("remind_minute", 0)
         iv = int(it.get("interval_days") or 1)
         ds = f"каждые {iv} дн." if iv > 1 else "каждый день"
-        lines.append(f"  {n}. {it['text']} _{h:02d}:{m_:02d}_ ({ds})  `#{it['id']}`")
-    lines.append("\n_/delete [id] — удалить_")
+        lines.append(f"  `{it['id']}` — {it['text']} _{h:02d}:{m_:02d}_ ({ds})")
+    lines.append("\n_/delete [номер] — удалить_")
     await u.effective_message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 async def cmd_list(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -803,23 +766,23 @@ async def cmd_list(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     for _, (label, grp) in groups.items():
         if not grp: continue
         lines.append(f"*{label}:*")
-        for n, it in enumerate(grp, 1):
+        for it in grp:
             h  = it.get("remind_hour")
             m_ = it.get("remind_minute", 0)
             iv = int(it.get("interval_days") or 1)
             ts = f" _{h:02d}:{m_:02d}_" if h is not None else ""
             ds = (f" _(каждые {iv} дн.)_" if iv > 1
                   else " _(ежедн.)_" if it.get("is_daily") else "")
-            lines.append(f"  {n}. {it['text']}{ts}{ds}  `#{it['id']}`")
+            lines.append(f"  `{it['id']}` — {it['text']}{ts}{ds}")
         lines.append("")
 
     if soft:
         lines.append("*📌 Задачи-напоминалки:*")
-        for n, it in enumerate(soft, 1):
-            lines.append(f"  {n}. {it['text']}  `#{it['id']}`")
+        for it in soft:
+            lines.append(f"  `{it['id']}` — {it['text']}")
         lines.append("")
 
-    lines.append("_/delete [id] — удалить_")
+    lines.append("_/delete [номер] — удалить_")
     await u.effective_message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 async def cmd_today(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -893,11 +856,6 @@ async def on_msg(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cid    = u.effective_chat.id
     text   = u.message.text
     memory = mem_load(cid)
-
-    # ── Сохраняем сообщение пользователя в историю ───────────
-    hist_add(cid, "user", text)
-    history = hist_get(cid)[:-1]  # история без текущего сообщения
-
     await u.message.reply_chat_action("typing")
 
     # ── 1. Проверяем префикс ПЕРВЫМ ─────────────────────────────
@@ -1034,10 +992,8 @@ async def on_msg(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     else:  # chat
         soft  = soft_pending(cid)
-        reply = await ai_reply(text, memory, soft if soft else None, history)
-        bot_reply = reply or FALLBACK
-        await u.message.reply_text(bot_reply)
-        hist_add(cid, "assistant", bot_reply)
+        reply = await ai_reply(text, memory, soft if soft else None)
+        await u.message.reply_text(reply or FALLBACK)
 
 # ══════════════════════════════════════════════════════════════
 #  POST_INIT — меню + команды
@@ -1059,18 +1015,8 @@ async def post_init(app: Application):
         BotCommand("help",      "📖 Справка"),
     ]
 
-    # Устанавливаем команды глобально (default) и для личных чатов
-    try:
-        await app.bot.set_my_commands(commands, scope=BotCommandScopeDefault())
-        log.info("✅ Команды установлены (Default scope)")
-    except Exception as e:
-        log.warning(f"set_my_commands Default: {e}")
-
-    try:
-        await app.bot.set_my_commands(commands, scope=BotCommandScopeAllPrivateChats())
-        log.info("✅ Команды установлены (AllPrivateChats scope)")
-    except Exception as e:
-        log.warning(f"set_my_commands AllPrivateChats: {e}")
+    # Устанавливаем команды глобально
+    await app.bot.set_my_commands(commands)
 
     # Кнопка «Меню» в поле ввода → открывает список команд
     try:
@@ -1079,7 +1025,7 @@ async def post_init(app: Application):
     except Exception as e:
         log.warning(f"set_chat_menu_button: {e}")
 
-    log.info(f"✅ Инициализация завершена ({len(commands)} команд)")
+    log.info(f"✅ Команды зарегистрированы ({len(commands)} шт.)")
 
 # ══════════════════════════════════════════════════════════════
 #  MAIN
