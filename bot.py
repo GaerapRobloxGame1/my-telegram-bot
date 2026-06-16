@@ -1,5 +1,5 @@
 # =============================================================
-#  Telegram Personal Assistant Bot — v4.2
+#  Telegram Personal Assistant Bot — v4.2 (PL)
 #  AI:  Gemini 3.5 Flash
 #  DB:  Supabase
 #
@@ -110,6 +110,400 @@ async def check_access(update: Update) -> bool:
     user = update.effective_user
     if is_allowed(user.id):
         return True
+    await update.effective_message.reply_text(
+        f"⛔ *Dostęp zamknięty*\n\nCześć, {user.first_name or 'Użytkownik'}!\n"
+        f"Twoje ID:\n`{user.id}`",
+        parse_mode="Markdown",
+    )
+    return False
+
+# ──────────────────────── КЛИЕНТЫ ─────────────────────────────
+db: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+http = Flask(__name__)
+
+@http.route("/")
+@http.route("/health")
+def health():
+    return "Bot is alive! 🤖", 200
+
+def start_flask():
+    http.run(host="0.0.0.0", port=PORT, use_reloader=False)
+
+# ══════════════════════════════════════════════════════════════
+#  БАЗА ДАННЫХ
+# ══════════════════════════════════════════════════════════════
+def db_add(chat_id, kind, text, hour=None, minute=0,
+           daily=False, interval_days=1) -> dict | None:
+    row = {
+        "chat_id": str(chat_id), "type": kind, "text": text,
+        "remind_hour": hour, "remind_minute": int(minute or 0),
+        "is_daily": bool(daily), "is_active": True, "last_sent_date": None,
+    }
+    try:
+        r = db.table("bot_items").insert({**row, "interval_days": int(interval_days or 1)}).execute()
+        return r.data[0] if r.data else None
+    except Exception:
+        pass
+    try:
+        r = db.table("bot_items").insert(row).execute()
+        return r.data[0] if r.data else None
+    except Exception as e:
+        log.error(f"db_add: {e}"); return None
+
+def db_get(chat_id, kind=None) -> list:
+    try:
+        q = (db.table("bot_items").select("*")
+               .eq("chat_id", str(chat_id)).eq("is_active", True))
+        if kind:
+            q = q.eq("type", kind)
+        return q.order("id").execute().data or []
+    except Exception as e:
+        log.error(f"db_get: {e}"); return []
+
+def db_off(item_id, chat_id):
+    try:
+        (db.table("bot_items").update({"is_active": False})
+           .eq("id", item_id).eq("chat_id", str(chat_id)).execute())
+    except Exception as e:
+        log.error(f"db_off: {e}")
+
+def db_due(hour, minute) -> list:
+    try:
+        return (db.table("bot_items").select("*")
+                  .eq("is_active", True).eq("remind_hour", hour)
+                  .eq("remind_minute", minute).execute().data or [])
+    except Exception as e:
+        log.error(f"db_due: {e}"); return []
+
+def db_mark_sent(item_id: int, sent_date: str):
+    try:
+        db.table("bot_items").update({"last_sent_date": sent_date}).eq("id", item_id).execute()
+    except Exception as e:
+        log.error(f"db_mark_sent: {e}")
+
+# ── Память ──────────────────────────────────────────────────
+MEM_MAX = 500
+
+def mem_load(chat_id: int) -> str:
+    try:
+        r = db.table("bot_memory").select("facts").eq("chat_id", str(chat_id)).execute()
+        return (r.data[0].get("facts") or "").strip() if r.data else ""
+    except Exception:
+        return ""
+
+def mem_save(chat_id: int, facts: str):
+    try:
+        db.table("bot_memory").upsert({
+            "chat_id": str(chat_id), "facts": facts[:MEM_MAX],
+            "updated_at": datetime.now(TZ).isoformat(),
+        }).execute()
+    except Exception as e:
+        log.error(f"mem_save: {e}")
+
+def mem_add_fact(chat_id: int, fact: str):
+    cur = mem_load(chat_id)
+    if fact.lower().strip() in cur.lower():
+        return
+    updated = (cur + "\n" + fact).strip()
+    if len(updated) > MEM_MAX:
+        lines = updated.split("\n")
+        while len("\n".join(lines)) > MEM_MAX and lines:
+            lines.pop(0)
+        updated = "\n".join(lines)
+    mem_save(chat_id, updated)
+
+def mem_clear(chat_id: int):
+    mem_save(chat_id, "")
+
+# ── Мягкие задачи (~каждые 8 ч) ────────────────────────────
+def _hour_block(dt: datetime) -> str:
+    b = 0 if dt.hour < 8 else (8 if dt.hour < 16 else 16)
+    return f"{dt.strftime('%Y-%m-%d')}-{b}"
+
+def soft_add(chat_id: int, text: str):
+    db_add(chat_id, "soft_task", text)
+
+def soft_pending(chat_id: int) -> list[str]:
+    try:
+        block = _hour_block(datetime.now(TZ))
+        items = (db.table("bot_items").select("*")
+                   .eq("chat_id", str(chat_id))
+                   .eq("type", "soft_task").eq("is_active", True)
+                   .execute().data or [])
+        out = []
+        for it in items:
+            if (it.get("last_reminded") or "") != block:
+                out.append(it["text"])
+                try:
+                    db.table("bot_items").update({"last_reminded": block}).eq("id", it["id"]).execute()
+                except Exception:
+                    pass
+        return out
+    except Exception as e:
+        log.error(f"soft_pending: {e}"); return []
+
+# ══════════════════════════════════════════════════════════════
+#  ПРЕФИКСНАЯ СИСТЕМА
+#  Форматы: (ПАМЯТЬ) текст   |   ПАМЯТЬ: текст
+# ══════════════════════════════════════════════════════════════
+PREFIX_MAP: dict[str, str] = {
+    # Pamięć
+    "PAMIĘĆ":        "add_memory",
+    "PAMIĘTAJ":      "add_memory",
+    # Przypomnienia
+    "PRZYPOMNIJ":    "add_reminder",
+    "PRZYPOMNIENIE": "add_reminder",
+    "PRZYPOMINAJ":   "add_reminder",
+    # Notatki
+    "NOTATKA":       "add_note",
+    "ZAPISZ":        "add_note",
+    # Nawyki
+    "NAWYK":         "add_habit",
+    "NAWYKI":        "add_habit",
+    # Zadania
+    "ZADANIE":       "add_soft_task",
+    "DEADLINE":      "add_soft_task",
+    # Plan dnia
+    "PLAN":          "make_plan",
+    # Cytaty
+    "CYTATY":        "set_quote",
+    "CYTAT":         "set_quote",
+    # Serwisowe
+    "USUŃ":          "delete",
+    "LISTA":         "list",
+}
+
+# Описание для /help
+PREFIX_HELP = {
+    "PAMIĘĆ":     "stałe fakty o Tobie",
+    "PRZYPOMNIJ": "przypomnienie o określonej godzinie",
+    "NOTATKA":    "notatka (codziennie o 9:00)",
+    "NAWYK":      "regularny nawyk",
+    "ZADANIE":    "zadanie z terminem (~8h)",
+    "PLAN":       "stwórz plan na dzień",
+    "CYTATY":     "skonfiguruj codzienne cytaty",
+}
+
+def parse_prefix(text: str) -> tuple[str | None, str]:
+    """
+    Определяет префикс в тексте.
+    Форматы:
+      (ПАМЯТЬ) запомни что...
+      ПАМЯТЬ: запомни что...
+    Возвращает (action, cleaned_text) или (None, original_text).
+    """
+    t = text.strip()
+    # (КЛЮЧЕВОЕ_СЛОВО) текст
+    if m := re.match(r'^\(([^)]+)\)\s*(.*)', t, re.I | re.S):
+        key  = m.group(1).upper().strip()
+        body = m.group(2).strip()
+    # КЛЮЧЕВОЕ_СЛОВО: текст
+    elif m := re.match(r'^([A-ZĄĆĘŁŃÓŚŹŻa-ząćęłńóśźż]+):\s*(.*)', t, re.I | re.S):
+        key  = m.group(1).upper().strip()
+        body = m.group(2).strip()
+    else:
+        return None, text
+
+    action = PREFIX_MAP.get(key)
+    if not action:
+        return None, text
+    return action, body or text
+
+# ══════════════════════════════════════════════════════════════
+#  ПАРСЕР  (keyword-first → AI → regex fallback)
+# ══════════════════════════════════════════════════════════════
+def _regex_hints(text: str) -> dict:
+    result = {}
+    t = text.lower()
+    if m := re.search(r'\bo\s+(\d{1,2}):(\d{2})\b', t):
+        result["hour"], result["minute"] = int(m.group(1)), int(m.group(2))
+    elif m := re.search(r'\bo\s+(\d{1,2})\s+(?:godz(?:inie)?\.?)', t):
+        result["hour"], result["minute"] = int(m.group(1)), 0
+    elif m := re.search(r'\bo\s+(\d{1,2})\s+(?:wieczorem|po\s+południu)\b', t):
+        h = int(m.group(1))
+        result["hour"], result["minute"] = (h + 12 if h < 12 else h), 0
+    elif m := re.search(r'\bo\s+(\d{1,2})\s+rano\b', t):
+        result["hour"], result["minute"] = int(m.group(1)), 0
+    elif re.search(r'\bpołudnie\b', t):
+        result["hour"], result["minute"] = 12, 0
+    elif re.search(r'\bpółnoc\b', t):
+        result["hour"], result["minute"] = 0, 0
+
+    if re.search(r'co\s+drugi\s+dzie[nń]|co\s+2\s+dni', t):
+        result["interval_days"], result["is_daily"] = 2, True
+    elif m := re.search(r'co\s+(\d+)\s+dni|raz\s+na\s+(\d+)\s+dni', t):
+        n = int(m.group(1) or m.group(2))
+        result["interval_days"], result["is_daily"] = n, True
+    elif re.search(r'codziennie|ka[żz]dego\s+dnia|ka[żz]dy\s+dzie[nń]', t):
+        result["interval_days"], result["is_daily"] = 1, True
+    return result
+
+
+def _keyword_intent(text: str) -> str | None:
+    t = text.lower()
+    if re.search(r'\bprzypomnij\b|\bprzypominaj\b', t):     return "add_reminder"
+    if re.search(r'\bstwórz\s+plan|\bzrób\s+plan|\bplan\s+na\s+dzie[nń]\b', t): return "make_plan"
+    if re.search(r'\blista\b|poka[żz].*zadani|co\s+mam\s+do', t):            return "list"
+    if re.search(r'\busu[nń]\b|\bskasuj\b', t) and re.search(r'\d+', t):     return "delete"
+    if re.search(r'\bzapami[eę]taj\b|\bzapisz\b|\bpami[eę]taj\b', t):
+        if re.search(r'mam na imi[eę]|m[oó]j styl|zwracaj si[eę]|ucz[eę] si[eę]|pracuj[eę]|'
+                     r'mieszkam|rozmawiaj|m[oó]j nick|moje imi[eę]', t):
+            return "add_memory"
+        if re.search(r'\bmusze\b|\btrzeba\b|\bpowinienem\b|'
+                     r'na\s+(poniedzia[łl]ek|wtorek|[śs]rod[eę]|czwartek|pi[ąa]tek|'
+                     r'sobot[eę]|niedziel[eę]|nast[eę]pn)', t):
+            return "add_soft_task"
+        return "add_note"
+    if re.search(r'nie\s+zapomnij\s+przypomnie[ćc]|przypomnij\s+p[oó][źz]niej', t): return "add_soft_task"
+    if re.search(r'moja\s+pami[eę][ćc]|co\s+pami[eę]tasz|poka[żz]\s+pami[eę][ćc]', t): return "show_memory"
+    if re.search(r'wyczy[śs][ćc]\s+pami[eę][ćc]|zapomnij\s+wszystko|usu[nń]\s+pami[eę][ćc]', t): return "clear_memory"
+    if re.search(r'wysy[łl]aj\s+cytaty|skonfiguruj\s+cytaty', t):            return "set_quote"
+    return None
+
+
+def _extract_text(action: str, raw: str) -> str:
+    t = raw
+    if action in ("add_reminder", "add_habit"):
+        for p in [r'przypomnij(cie)?\s*(mi)?\s*', r'przypominaj\s*(mi)?\s*',
+                  r'co\s+\d+\s+dni\w*', r'co\s+drugi\s+dzie[nń]',
+                  r'codziennie', r'ka[żz]dego\s+dnia',
+                  r'raz\s+na\s+\d+\s+dni\w*', r'o\s+\d{1,2}:\d{2}',
+                  r'o\s+\d{1,2}\s+(godz(?:inie)?|rano|wieczorem|po\s+południu)',
+                  r'o\s+(południe|północ)']:
+            t = re.sub(p, '', t, flags=re.I)
+    elif action in ("add_note", "add_soft_task"):
+        t = re.sub(r'^zapami[eę]taj\s*(że)?\s*', '', t, flags=re.I)
+        t = re.sub(r'^zapisz\s*(że)?\s*',         '', t, flags=re.I)
+        t = re.sub(r'^nie\s+zapomnij\s*(że)?\s*', '', t, flags=re.I)
+    elif action == "add_memory":
+        t = re.sub(r'^zapami[eę]taj\s*(że)?\s*', '', t, flags=re.I)
+        t = re.sub(r'^zapisz\s*(że)?\s*',         '', t, flags=re.I)
+    return t.strip() or raw.strip()
+
+
+PARSE_SYS = """\
+Jesteś precyzyjnym parserem poleceń. Zwróć TYLKO prawidłowy JSON.
+Akcje: add_reminder, add_note, add_habit, add_memory, add_soft_task,
+       make_plan, show_memory, clear_memory, list, delete, set_quote, chat.
+"""
+PARSE_TMPL = """\
+Czas: {now}
+Wiadomość: "{msg}"
+Wskazówka akcji: {hint}
+
+JSON:
+{{
+  "action": "{hint}",
+  "text": "krótka treść",
+  "hour": null, "minute": 0,
+  "is_daily": false, "interval_days": 1,
+  "delete_id": null, "quote_example": null,
+  "memory_fact": null, "plan_activities": null
+}}
+
+Czas: "o 12:03"→h=12,m=3 | "o 20:00"→h=20 | "o 8 wieczorem"→h=20
+Interwał: "co drugi dzień"→2 | "co 3 dni"→3 | "codziennie"→1
+add_memory: memory_fact = krótki fakt
+make_plan:  plan_activities = lista czynności po przecinku
+"""
+
+async def ai_parse(text: str) -> dict:
+    hints   = _regex_hints(text)
+    keyword = _keyword_intent(text)
+    now     = datetime.now(TZ).strftime("%H:%M %d.%m.%Y")
+
+    # Быстрый путь: keyword + время без AI
+    if keyword == "add_reminder" and hints.get("hour") is not None:
+        return {"action": "add_reminder", "text": _extract_text("add_reminder", text),
+                "hour": hints["hour"], "minute": hints.get("minute", 0),
+                "is_daily": hints.get("is_daily", False),
+                "interval_days": hints.get("interval_days", 1)}
+    if keyword in ("list", "show_memory", "clear_memory"):
+        return {"action": keyword}
+    if keyword == "delete":
+        m = re.search(r'\d+', text)
+        return {"action": "delete", "delete_id": int(m.group()) if m else None}
+
+    prompt = PARSE_TMPL.format(now=now, msg=text, hint=keyword or "chat")
+    try:
+        raw  = await asyncio.to_thread(_call, prompt, PARSE_SYS, True, 0.05)
+        data = json.loads(raw)
+        if keyword and data.get("action") in ("chat", "unknown", None):
+            data["action"] = keyword
+        if hints.get("hour") is not None and data.get("hour") is None:
+            if data.get("action") in ("add_reminder", "add_habit"):
+                data["hour"]   = hints["hour"]
+                data["minute"] = hints.get("minute", 0)
+        if hints.get("interval_days", 1) > 1 and data.get("interval_days", 1) <= 1:
+            data["interval_days"] = hints["interval_days"]
+            data["is_daily"]      = True
+        if hints.get("is_daily") and not data.get("is_daily"):
+            data["is_daily"] = True
+        return data
+    except Exception as e:
+        log.error(f"ai_parse: {e}")
+        if keyword:
+            return {"action": keyword, "text": _extract_text(keyword, text),
+                    "hour": hints.get("hour"), "minute": hints.get("minute", 0),
+                    "is_daily": hints.get("is_daily", False),
+                    "interval_days": hints.get("interval_days", 1)}
+        if hints.get("hour") is not None:
+            return {"action": "add_reminder", "text": text.strip(),
+                    "hour": hints["hour"], "minute": hints.get("minute", 0),
+                    "is_daily": hints.get("is_daily", False),
+                    "interval_days": hints.get("interval_days", 1)}
+        return {"action": "chat"}
+
+# ══════════════════════════════════════════════════════════════
+#  AI ФУНКЦИИ
+# ══════════════════════════════════════════════════════════════
+async def ai_confirm(summary: str, memory: str = "") -> str | None:
+    mem = f"\n[O użytkowniku: {memory}]" if memory else ""
+    prompt = (f"Jesteś asystentem.{mem}\n"
+              f"Właśnie wykonałeś: {summary}\n\n"
+              f"Napisz JEDNO krótkie potwierdzenie (1–2 zdania) po polsku. "
+              f"Przyjaźnie, bez zbędnych słów.")
+    try:
+        return (await asyncio.to_thread(_call, prompt, None, False, 0.7)).strip()
+    except Exception as e:
+        log.error(f"ai_confirm: {e}"); return None
+
+async def ai_reply(text: str, memory: str = "",
+                   soft_tasks: list[str] | None = None) -> str | None:
+    sys_parts = ["Jesteś inteligentnym osobistym asystentem w Telegramie. Odpowiadaj po polsku."]
+    if memory:
+        sys_parts.append(f"\nCO WIESZ O UŻYTKOWNIKU (stosuj to):\n{memory}")
+    sys_parts.append("\nZasady: przestrzegaj instrukcji użytkownika z pamięci. "
+                     "Odpowiadaj krótko jeśli nie proszą o długie odpowiedzi.")
+    user_msg = text
+    if soft_tasks:
+        tasks = "\n".join(f"• {t}" for t in soft_tasks)
+        user_msg = f"{text}\n\n[Delikatnie przypomnij na końcu o zadaniach:\n{tasks}]"
+    try:
+        return (await asyncio.to_thread(
+            _call, user_msg, "\n".join(sys_parts), False, 0.75
+        )).strip()
+    except Exception as e:
+        log.error(f"ai_reply: {e}"); return None
+
+async def ai_plan(activities: str, memory: str = "") -> str | None:
+    now = datetime.now(TZ)
+    prompt = (
+        f"{'O użytkowniku: ' + memory + chr(10) if memory else ''}"
+        f"Teraz: {now.strftime('%H:%M, %d.%m.%Y')}\n"
+        f"Użytkownik chce dzisiaj: {activities}\n\n"
+        f"Stwórz inteligentny plan na resztę dnia z przedziałami czasowymi. "
+        f"Ułóż sprawy w odpowiedniej kolejności, uwzględnij przerwy. "
+        f"Format: 🕒 GG:MM — Zadanie (krótki komentarz)\n"
+        f"Na końcu — jedno zdanie motywacyjne. Bez zbędnych słów."
+    )
+    try:
+        return (await asyncio.to_thread(_call, prompt, None, False, 0.6)).strip()
+    except Exception as e:
+        log.error(f"ai_plan: {e}"); return None
+
+async def ai_quote(example: str) -> str:        return True
     await update.effective_message.reply_text(
         f"⛔ *Доступ закрыт*\n\nПривет, {user.first_name or 'Пользователь'}!\n"
         f"Твой ID:\n`{user.id}`",
